@@ -66,7 +66,11 @@ ENVIRONMENT = "wwt-atc"
 OUTCOME_ID = "O1"
 EXPECTED_GPUS = 8
 EXPECTED_GPU_NAME = "H200"
-EXPECTED_HBM_GB = 140.0           # H200 SXM5 = 141 GB; allow driver rounding
+# H200 SXM5 markets "141 GB" (decimal); torch reports binary GiB and the driver
+# reserves a slice, so a healthy device shows ~139.7-140.4 GiB. The check only
+# needs to reject smaller SKUs (H100-80GB) or an active MIG slice, so gate well
+# below the real capacity rather than at it.
+EXPECTED_HBM_GIB_MIN = 130.0
 
 MODELS = {
     "qwen": {
@@ -163,9 +167,10 @@ def validate_setup(args):
     if EXPECTED_GPU_NAME not in name:
         die(f"Expected {EXPECTED_GPU_NAME}-class GPUs, found '{name}'")
     ok.append(f"GPU model: {name}")
-    if min(mems) < EXPECTED_HBM_GB:
-        die(f"GPU HBM {min(mems):.0f} GB < expected ~141 GB — wrong SKU or MIG active?")
-    ok.append(f"HBM per GPU: {min(mems):.0f} GB")
+    if min(mems) < EXPECTED_HBM_GIB_MIN:
+        die(f"GPU HBM {min(mems):.1f} GiB < {EXPECTED_HBM_GIB_MIN:.0f} GiB floor — "
+            f"wrong SKU (H100-80GB?) or MIG slice active")
+    ok.append(f"HBM per GPU: {min(mems):.1f} GiB (H200 141GB-class)")
 
     # P2P / NVLink reachability (TP8 requirement)
     p2p_fail = [(i, j) for i in range(n) for j in range(n)
