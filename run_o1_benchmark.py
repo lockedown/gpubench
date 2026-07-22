@@ -207,12 +207,23 @@ def validate_setup(args):
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     ok.append("HF offline mode forced (no live download during measurement)")
 
+    overrides = dict(kv.split("=", 1) for kv in (args.model_path or []))
     for key in args.models:
         m = MODELS[key]
-        path = resolve_model_path(m["hf_id"], args.model_root)
+        path, searched = resolve_model_path(m["hf_id"], args.model_root,
+                                            model_key=key, override=overrides.get(key))
         if path is None:
-            die(f"Weights for {m['hf_id']} not found under --model-root or HF cache. "
-                f"Mirror them locally before running (methodology page 3).")
+            paths = "\n".join(f"    - {s}" for s in searched)
+            die(f"Weights for {m['hf_id']} not found (no .safetensors in any of):\n"
+                f"{paths}\n"
+                f"  Fix one of:\n"
+                f"    * point --model-root at your mirror (searched layouts above)\n"
+                f"    * pass an explicit dir:  --model-path {key}=/abs/path/to/weights\n"
+                f"    * mirror once, OUTSIDE the measurement window (page-3 rule):\n"
+                f"        hf download {m['hf_id']} --local-dir "
+                f"{args.model_root}/{m['hf_id']}\n"
+                f"  Note: a dir that exists but holds only config/tokenizer files is\n"
+                f"  treated as not-mirrored — an interrupted download looks like this.")
         m["local_path"] = path
         ok.append(f"{m['hf_id']} -> {path}")
         if m["pinned_sha256"] and args.verify_sha:
@@ -236,22 +247,43 @@ def validate_setup(args):
     return info
 
 
-def resolve_model_path(hf_id, root):
-    """Find locally mirrored weights: --model-root/<org>/<name>, then HF cache."""
+def _has_weights(d):
+    """A usable model dir must contain actual weight shards, not just config."""
+    try:
+        return any(f.endswith(".safetensors") for f in os.listdir(d))
+    except OSError:
+        return False
+
+
+def resolve_model_path(hf_id, root, model_key=None, override=None):
+    """Find locally mirrored weights. Search order:
+    1. --model-path <key>=<dir> override
+    2. <model-root>/<org>/<name>, <model-root>/<name>, <model-root>/<key>
+    3. HF cache (HF_HOME) newest snapshot
+    Returns (path_or_None, list_of_paths_searched)."""
+    searched = []
     cands = []
+    if override:
+        cands.append(override)
     if root:
-        cands += [os.path.join(root, hf_id), os.path.join(root, hf_id.split("/")[-1])]
-    hub = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-    cands.append(os.path.join(hub, "hub", f"models--{hf_id.replace('/', '--')}"))
+        cands += [os.path.join(root, hf_id),
+                  os.path.join(root, hf_id.split("/")[-1])]
+        if model_key:
+            cands.append(os.path.join(root, model_key))
     for c in cands:
-        if os.path.isdir(c):
-            if "models--" in c:  # HF cache layout -> newest snapshot
-                snaps = os.path.join(c, "snapshots")
-                if os.path.isdir(snaps) and os.listdir(snaps):
-                    return os.path.join(snaps, sorted(os.listdir(snaps))[-1])
-                continue
-            return c
-    return None
+        searched.append(c)
+        if os.path.isdir(c) and _has_weights(c):
+            return c, searched
+    hub = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    cache = os.path.join(hub, "hub", f"models--{hf_id.replace('/', '--')}")
+    searched.append(cache)
+    snaps = os.path.join(cache, "snapshots")
+    if os.path.isdir(snaps):
+        for snap in sorted(os.listdir(snaps), reverse=True):  # newest first
+            p = os.path.join(snaps, snap)
+            if _has_weights(p):
+                return p, searched
+    return None, searched
 
 
 def sha256_of_weights(path):
@@ -620,6 +652,9 @@ def parse_args():
     ap.add_argument("--out-headroom", type=int, default=256,
                     help="extra max_model_len for generated tokens")
     ap.add_argument("--model-root", default=os.environ.get("WWT_MODEL_ROOT", "/models"))
+    ap.add_argument("--model-path", action="append", metavar="KEY=DIR",
+                    help="explicit weights dir per model, e.g. --model-path "
+                         "qwen=/data/mirrors/qwen3.5-122b (repeatable)")
     ap.add_argument("--pod-label", default="XE9680-A")
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
     ap.add_argument("--seed", type=int, default=1234)
