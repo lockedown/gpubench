@@ -54,8 +54,13 @@ import statistics
 import sys
 import time
 import uuid
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+# vLLM V1 spawns engine-core worker processes; fork-after-CUDA-init is fatal.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 # ── Methodology constants (v1.3) ──────────────────────────────────────────────
 TTFT_CEILING_MS = 1500.0          # O1 4a: interactive (SLO) ceiling bound
@@ -244,6 +249,10 @@ def validate_setup(args):
     for line in warn:
         print(f"  WARN  {line}")
     print("──────────────────────────────────────────────────\n")
+    if args.emit_info:
+        info["model_paths"] = {k: MODELS[k]["local_path"] for k in args.models}
+        with open(args.emit_info, "w") as f:
+            json.dump(info, f)
     return info
 
 
@@ -337,6 +346,21 @@ def build_engine(model_cfg, max_len, block_size, tp):
     return AsyncLLMEngine.from_engine_args(ea)
 
 
+def model_max_positions(local_path):
+    """Read max_position_embeddings from the model's config.json (multimodal
+    configs may nest it under text_config). None if not determinable."""
+    try:
+        with open(os.path.join(local_path, "config.json")) as f:
+            cfg = json.load(f)
+        for scope in (cfg, cfg.get("text_config") or {}):
+            v = scope.get("max_position_embeddings")
+            if v:
+                return int(v)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def make_prompt_ids(tokenizer, ctx_len, seed):
     """Synthetic prompt of exactly ctx_len tokens, deterministic per (ctx,seed)."""
     rng = random.Random(f"{ctx_len}-{seed}")
@@ -413,8 +437,24 @@ def kv_bytes_per_token_from_config(engine, model_cfg):
 
 
 def gpu_mem_max_gb():
-    import torch
-    return max(torch.cuda.max_memory_allocated(i) for i in range(torch.cuda.device_count())) / 1024**3
+    """Device-level used memory via NVML. Parent-process torch counters are
+    meaningless under vLLM V1 (allocations live in spawned worker processes)."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            return max(pynvml.nvmlDeviceGetMemoryInfo(
+                pynvml.nvmlDeviceGetHandleByIndex(i)).used
+                for i in range(pynvml.nvmlDeviceGetCount())) / 1024**3
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # noqa: BLE001 — fall back to parent allocator (V0/in-proc)
+        try:
+            import torch
+            return max(torch.cuda.max_memory_allocated(i)
+                       for i in range(torch.cuda.device_count())) / 1024**3
+        except Exception:  # noqa: BLE001
+            return 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -490,15 +530,25 @@ async def find_memory_ceiling(engine, prompt_ids, out_tokens, start, max_session
                          stagger_s, bad, "MEM")
 
 
-async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, args):
-    """One (model x context x kv_mode) cell -> CSV row dict."""
-    import torch
+async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, args,
+                   max_len=None):
+    """One (model x context x kv_mode) cell -> CSV row dict.
+
+    Deliberately touches no torch.cuda API: under vLLM V1 the parent process
+    must stay CUDA-clean, and memory telemetry comes from NVML instead."""
     t_cell = time.perf_counter()
     started = datetime.now(timezone.utc).isoformat()
-    for i in range(torch.cuda.device_count()):
-        torch.cuda.reset_peak_memory_stats(i)
 
-    prompt_ids = make_prompt_ids(tokenizer, ctx, args.seed)
+    # Prompt + generated tokens must fit inside max_model_len. At the top of the
+    # context sweep this trims the prompt by out_tokens — never override the
+    # model's position limit instead (RoPE past it produces NaNs).
+    prompt_len, trim_note = ctx, ""
+    if max_len and ctx + prof["out"] > max_len:
+        prompt_len = max_len - prof["out"]
+        trim_note = (f"; prompt trimmed {ctx}->{prompt_len} so prompt+{prof['out']} "
+                     f"generated tokens fit max_position_embeddings={max_len}")
+        log(f"  ctx={ctx}: prompt trimmed to {prompt_len} (+{prof['out']} gen = model max)")
+    prompt_ids = make_prompt_ids(tokenizer, prompt_len, args.seed)
     log(f"  ctx={ctx} block={block_size}: warm-up ({prof['warm']}s)")
     solo = await run_burst(engine, prompt_ids, 1, prof["out"], hold_s=prof["warm"])
     itl_solo_p99 = solo.p(solo.itl_ms, 0.99) if solo.itl_ms else 0.0
@@ -575,7 +625,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "operator": args.operator,
         "notes": f"kv-derivation={kv_note}; ttft_bound={TTFT_CEILING_MS}ms; "
                  f"itl_health=3x{round(itl_solo_p99,1)}ms; stagger={args.stagger}s; "
-                 f"profile={args.profile}; methodology=v1.3"
+                 f"profile={args.profile}; methodology=v1.3" + trim_note
                  + (f"; ERROR={b.error}" if b.error else ""),
     }
 
@@ -605,8 +655,14 @@ async def main_async(args, info):
         m = MODELS[key]
         ctxs = args.context_lengths or m["context_lengths"]
         tokenizer = AutoTokenizer.from_pretrained(m["local_path"], trust_remote_code=True)
+        mpe = model_max_positions(m["local_path"])
         for block in args.block_sizes:
             max_len = max(ctxs) + args.out_headroom
+            if mpe and max_len > mpe:
+                log(f"── max_model_len capped {max_len} -> {mpe} "
+                    f"(model max_position_embeddings; top-of-sweep prompts are "
+                    f"trimmed by out_tokens rather than overriding the limit)")
+                max_len = mpe
             log(f"── engine: {m['hf_id']}  TP{args.tp}  max_len={max_len}  block={block}")
             engine = build_engine(m, max_len, block, args.tp)
             try:
@@ -617,7 +673,8 @@ async def main_async(args, info):
                         log(f"  ctx={ctx} block={block}: already in CSV — skipped")
                         continue
                     prof = dict(PROFILES[args.profile])
-                    row = await run_cell(engine, tokenizer, m, ctx, block, prof, info, args)
+                    row = await run_cell(engine, tokenizer, m, ctx, block, prof,
+                                         info, args, max_len=max_len)
                     append_row(args.out, row)
                     log(f"  ctx={ctx}: slo={row['concurrent_sessions']} "
                         f"mem={row['concurrent_sessions_memory']} "
@@ -630,9 +687,8 @@ async def main_async(args, info):
                 except Exception:  # noqa: BLE001
                     pass
                 del engine
-                import torch, gc  # noqa: E401
-                gc.collect()
-                torch.cuda.empty_cache()
+                import gc
+                gc.collect()  # no torch.cuda calls here — parent stays CUDA-clean
                 time.sleep(10)  # let NCCL/TP workers tear down before next engine
     log(f"Sweep complete. Results: {args.out}")
 
@@ -663,6 +719,7 @@ def parse_args():
     ap.add_argument("--verify-sha", action="store_true",
                     help="verify weights against Appendix A pinned SHA-256")
     ap.add_argument("--validate-only", action="store_true")
+    ap.add_argument("--emit-info", default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
     a.models = [m.strip() for m in a.models.split(",") if m.strip()]
     for m in a.models:
@@ -676,10 +733,29 @@ def parse_args():
 
 def main():
     args = parse_args()
-    info = validate_setup(args)
     if args.validate_only:
+        validate_setup(args)
         log("Validation only — exiting.")
         return
+    # Run validation in a SEPARATE process: the GPU probes (P2P, device props)
+    # initialize CUDA, and vLLM V1's spawned engine cores fail to start if the
+    # parent already holds a CUDA context. The sweep process stays CUDA-clean.
+    info_path = os.path.join(tempfile.gettempdir(), f"o1_env_{os.getpid()}.json")
+    cmd = [sys.executable, os.path.abspath(__file__), "--validate-only",
+           "--emit-info", info_path, "--models", ",".join(args.models),
+           "--model-root", args.model_root]
+    for kv in (args.model_path or []):
+        cmd += ["--model-path", kv]
+    if args.verify_sha:
+        cmd.append("--verify-sha")
+    log("Running setup validation in a clean subprocess...")
+    if subprocess.run(cmd).returncode != 0:
+        die("validation failed — see output above")
+    with open(info_path) as f:
+        info = json.load(f)
+    os.unlink(info_path)
+    for k, p in info.pop("model_paths", {}).items():
+        MODELS[k]["local_path"] = p
     log(f"Profile '{args.profile}': {json.dumps(PROFILES[args.profile])}")
     log(f"TTFT ceiling bound: {TTFT_CEILING_MS} ms | CoV limit: {COV_LIMIT}")
     try:
