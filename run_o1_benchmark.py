@@ -5,7 +5,11 @@ O1 — KV cache memory scaling — execution harness
 HSBC GPU Benchmark Methodology v1.3 | WWT ATC on-prem | Dell XE9680, 8x H200 SXM5
 
 Implements the O1 key steps (v1.3 dual-ceiling model):
-  * Staggered admission (--stagger, default 250ms) — never simultaneous bursts.
+  * CLOSED-LOOP concurrency: N persistent workers each keep one request in
+    flight for the whole window (re-issue on completion), ramped in over at
+    most RAMP_BUDGET_S. Staggered *finite* requests are NOT equivalent — they
+    let sessions drain faster than they are admitted, capping real in-flight
+    concurrency near request_duration/stagger and idling the GPUs.
   * Interactive (SLO) ceiling: P99 TTFT of newly admitted sessions <= 1.5 s.
     Ceiling 0 at long contexts is an expected, informative result.
   * Memory ceiling: admission continues past the SLO ceiling ignoring TTFT,
@@ -67,6 +71,8 @@ TTFT_CEILING_MS = 1500.0          # O1 4a: interactive (SLO) ceiling bound
 MEM_ITL_MULT = 3.0                # O1 4b: decode-health bound = 3x solo P99 ITL
 TTFT_ABANDON_MS = 120000.0        # memory ramp: catastrophic queueing cut-off
 COV_LIMIT = 0.05                  # page 3: CoV <= 5% across repeats
+RAMP_BUDGET_S = 30.0              # max total ramp-in time regardless of N
+MEASURE_MIN_S = 20.0              # min steady-state window for search probes
 ENVIRONMENT = "wwt-atc"
 OUTCOME_ID = "O1"
 EXPECTED_GPUS = 8
@@ -375,61 +381,84 @@ def make_prompt_ids(tokenizer, ctx_len, seed):
 
 
 async def run_burst(engine, prompt_ids, sessions, out_tokens, hold_s=0.0, stagger_s=0.0):
-    """Launch `sessions` concurrent requests; measure per-request TTFT and ITL.
+    """CLOSED-LOOP concurrency: `sessions` persistent workers, each re-issuing
+    a new request the moment its previous one completes, so exactly N requests
+    stay in flight for the whole window. Workers ramp in over at most
+    RAMP_BUDGET_S; the measurement window runs max(hold_s, MEASURE_MIN_S) past
+    ramp-in. TTFT/ITL are taken from requests started at steady state.
 
-    v1.3: sessions are admitted with a fixed stagger (never a simultaneous
-    burst) so TTFT reflects steady-state admission, not queue drain."""
+    (v1.3.1 — replaces staggered finite requests, which let sessions finish
+    faster than they were admitted: in-flight concurrency plateaued near
+    request_duration/stagger regardless of N, idling the GPUs and producing
+    nonsense ceilings.)"""
     from vllm import SamplingParams, TokensPrompt
     sp = SamplingParams(max_tokens=out_tokens, temperature=0.0, ignore_eos=True)
     res = BurstResult(sessions=sessions)
+    eff_stagger = min(stagger_s, RAMP_BUDGET_S / max(sessions, 1)) if stagger_s else 0.0
+    t0_burst = time.perf_counter()
+    ramp_done = t0_burst + eff_stagger * sessions
+    window_end = ramp_done + max(hold_s, MEASURE_MIN_S)
+    pre_ttft, pre_itl = [], []          # samples from ramp-in requests (fallback)
+    stop = False
 
-    async def one(idx=0):
-        await asyncio.sleep(idx * stagger_s)
-        rid = uuid.uuid4().hex
-        t0 = time.perf_counter()
-        first, prev = None, None
-        async for out in engine.generate(TokensPrompt(prompt_token_ids=prompt_ids), sp, rid):
-            now = time.perf_counter()
-            ntok = len(out.outputs[0].token_ids) if out.outputs else 0
-            if ntok >= 1 and first is None:
-                first = now
-                res.ttft_ms.append((now - t0) * 1000)
-            elif first is not None and prev is not None and ntok >= 1:
-                res.itl_ms.append((now - prev) * 1000)
-            prev = now
+    async def worker(idx):
+        nonlocal stop
+        await asyncio.sleep(idx * eff_stagger)
+        try:
+            while not stop and time.perf_counter() < window_end:
+                rid = uuid.uuid4().hex
+                t0 = time.perf_counter()
+                steady = t0 >= ramp_done
+                ttft_dst = res.ttft_ms if steady else pre_ttft
+                itl_dst = res.itl_ms if steady else pre_itl
+                first, prev = None, None
+                async for out in engine.generate(
+                        TokensPrompt(prompt_token_ids=prompt_ids), sp, rid):
+                    now = time.perf_counter()
+                    ntok = len(out.outputs[0].token_ids) if out.outputs else 0
+                    if ntok >= 1 and first is None:
+                        first = now
+                        ttft_dst.append((now - t0) * 1000)
+                    elif first is not None and prev is not None and ntok >= 1:
+                        itl_dst.append((now - prev) * 1000)
+                    prev = now
+        except BaseException:
+            stop = True   # stop siblings issuing new requests, then surface it
+            raise
 
-    t_start = time.perf_counter()
-    while True:
-        # return_exceptions=True: every session is drained before the burst
-        # returns — an exception must never leave orphaned in-flight requests
-        # polluting the next measurement.
-        outs = await asyncio.gather(*[one(i) for i in range(sessions)],
-                                    return_exceptions=True)
-        for e in outs:
-            if isinstance(e, BaseException):
-                msg = str(e)
-                if "out of memory" in msg.lower() or "OutOfMemory" in type(e).__name__:
-                    res.oom = True
-                if not res.error:
-                    res.error = msg[:300]
-        if res.oom or res.error or time.perf_counter() - t_start >= hold_s:
-            break
+    # return_exceptions=True drains every worker before the burst returns — an
+    # exception must never leave orphaned in-flight requests polluting the
+    # next measurement.
+    outs = await asyncio.gather(*[worker(i) for i in range(sessions)],
+                                return_exceptions=True)
+    for e in outs:
+        if isinstance(e, BaseException):
+            msg = str(e)
+            if "out of memory" in msg.lower() or "OutOfMemory" in type(e).__name__:
+                res.oom = True
+            if not res.error:
+                res.error = msg[:300]
+    if not res.ttft_ms:                  # window shorter than one request cycle
+        res.ttft_ms, res.itl_ms = pre_ttft, pre_itl
     return res
 
 
-def kv_bytes_per_token_from_config(engine, model_cfg):
-    """Config-derived KV bytes/token/layer stack. MLA/GQA aware where exposed."""
+def kv_bytes_per_token_from_config(model_cfg):
+    """Config-derived KV bytes/token, read straight from the model's
+    config.json — engine introspection is version-fragile across vLLM V1
+    (this is why earlier rows showed kv-derivation=unavailable).
+    MLA (DeepSeek) and GQA/MHA aware; multimodal text_config handled."""
     try:
-        mc = engine.engine.model_config if hasattr(engine, "engine") else engine.model_config
-        hf = mc.hf_config
-        layers = getattr(hf, "num_hidden_layers")
-        kvh = getattr(hf, "num_key_value_heads", getattr(hf, "num_attention_heads", None))
-        hd = getattr(hf, "head_dim", None) or hf.hidden_size // hf.num_attention_heads
+        with open(os.path.join(model_cfg["local_path"], "config.json")) as f:
+            raw = json.load(f)
+        hf = {**raw, **(raw.get("text_config") or {})}
+        layers = hf["num_hidden_layers"]
         dsz = 2 if "bf16" in model_cfg["precision"] else 1
-        # MLA (DeepSeek): compressed latent replaces K/V heads
-        if hasattr(hf, "kv_lora_rank") and hf.kv_lora_rank:
-            per = layers * (hf.kv_lora_rank + getattr(hf, "qk_rope_head_dim", 0)) * dsz
+        if hf.get("kv_lora_rank"):   # MLA: compressed latent replaces K/V heads
+            per = layers * (hf["kv_lora_rank"] + hf.get("qk_rope_head_dim", 0)) * dsz
             return per, "mla"
+        kvh = hf.get("num_key_value_heads") or hf["num_attention_heads"]
+        hd = hf.get("head_dim") or hf["hidden_size"] // hf["num_attention_heads"]
         return 2 * layers * kvh * hd * dsz, "mha/gqa"
     except Exception as e:  # noqa: BLE001
         log(f"  kv-config derivation failed ({e}) — measured value only")
@@ -581,7 +610,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
            if len(ttfts) > 1 and statistics.mean(ttfts) > 0 else 0.0)
     ceiling = mem  # KV metrics are reported at the memory ceiling (v1.3)
 
-    per_tok, kv_note = kv_bytes_per_token_from_config(engine, model_cfg)
+    per_tok, kv_note = kv_bytes_per_token_from_config(model_cfg)
     kv_cfg = per_tok * ctx if per_tok else ""
     kv_meas = ""
     try:  # measured: engine KV block accounting, guarded (API drift across versions)
@@ -617,7 +646,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "repeats_completed": reps, "coefficient_of_variation": round(cov, 4),
         "cov_pass": cov <= COV_LIMIT,
         "serving_stack": f"vllm-on-instance/{info.get('vllm_version','?')}",
-        "harness_version": "wwt-o1-harness/1.1-dualceiling",
+        "harness_version": "wwt-o1-harness/1.2-closedloop",
         "driver_version": info.get("driver_version", ""),
         "torch_version": info.get("torch_version", ""),
         "run_start_utc": started,
