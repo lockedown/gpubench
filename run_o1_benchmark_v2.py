@@ -528,7 +528,10 @@ async def _search(engine, prompt_ids, out_tokens, start, max_sessions, stagger_s
                   is_bad, label):
     """Doubling ramp from `start` then binary search against predicate is_bad(burst).
     Returns (ceiling, burst@ceiling, reason_first_bad)."""
-    last_good, first_bad, results, reason = max(start, 0), None, {}, ""
+    # last_good starts at 0 ALWAYS: no session count is "good" until a probe
+    # has actually passed the predicate. (Seeding it with `start` returned
+    # ceiling=1 for cells where even a single session violates the bound.)
+    last_good, first_bad, results, reason = 0, None, {}, ""
     s = max(start, 1)
     while s <= max_sessions:
         log(f"    {label} ramp: {s} concurrent sessions")
@@ -643,6 +646,14 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         itls.extend(conf.itl_ms)
     cov = (statistics.pstdev(ttfts) / statistics.mean(ttfts)
            if len(ttfts) > 1 and statistics.mean(ttfts) > 0 else 0.0)
+    # Borderline-cell guard: a short search probe can pass at the ceiling while
+    # the longer confirmation window catches tail latency above the bound.
+    borderline = ""
+    if slo >= 1 and ttfts and max(ttfts) > TTFT_CEILING_MS:
+        borderline = (f"; BORDERLINE: confirmation P99 TTFT "
+                      f"{max(ttfts):.0f}ms exceeded the {TTFT_CEILING_MS:.0f}ms bound "
+                      f"at ceiling {slo} — treat interactive ceiling as {slo - 1}-{slo}")
+        log(f"  ctx={ctx}: borderline cell — confirmation exceeded the TTFT bound")
     ceiling = mem  # KV metrics are reported at the memory ceiling (v1.3)
 
     per_tok, kv_note = kv_bytes_per_token_from_config(model_cfg)
@@ -683,7 +694,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "repeats_completed": reps, "coefficient_of_variation": round(cov, 4),
         "cov_pass": cov <= COV_LIMIT,
         "serving_stack": f"vllm-on-instance/{info.get('vllm_version','?')}",
-        "harness_version": "wwt-o1-harness/1.2-closedloop",
+        "harness_version": "wwt-o1-harness/1.3-searchfix",
         "driver_version": info.get("driver_version", ""),
         "torch_version": info.get("torch_version", ""),
         "run_start_utc": started,
@@ -691,7 +702,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "operator": args.operator,
         "notes": f"kv-derivation={kv_note}; ttft_bound={TTFT_CEILING_MS}ms; "
                  f"itl_health=3x{round(itl_solo_p99,1)}ms; stagger={args.stagger}s; "
-                 f"profile={args.profile}; methodology=v1.3" + trim_note
+                 f"profile={args.profile}; methodology=v1.3" + trim_note + borderline
                  + (f"; ERROR={b.error}" if b.error else ""),
     }
 
