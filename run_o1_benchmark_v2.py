@@ -73,9 +73,9 @@ TTFT_ABANDON_MS = 120000.0        # memory ramp: catastrophic queueing cut-off
 COV_LIMIT = 0.05                  # page 3: CoV <= 5% across repeats
 RAMP_BUDGET_S = 30.0              # max total ramp-in time regardless of N
 MEASURE_MIN_S = 20.0              # min steady-state window for search probes
-ENVIRONMENT = "wwt-atc"
 OUTCOME_ID = "O1"
 EXPECTED_GPUS = 8
+VALID_ENVIRONMENTS = ["wwt-atc", "gcp", "aws", "azure", "alibaba", "oci"]  # Appendix B
 
 # Platform auto-detection from the device name. hbm_floor_gib gates well below
 # marketed capacity (decimal-GB marketing vs binary-GiB reporting, plus driver
@@ -87,6 +87,10 @@ PLATFORMS = {
                "pod_default": "DGX-H200-A", "aliases": ["H200"]},
     "MI300X": {"gpu_model": "mi300x-192gb-oam", "hbm_floor_gib": 170.0,
                "pod_default": "MI300X-A", "aliases": ["MI300X", "gfx942"]},
+    # Cloud fallback SKU (AWS p5.48xlarge etc.) — comparability caveat applies:
+    # 80GB HBM shifts memory ceilings vs the on-prem H200 reference.
+    "H100":   {"gpu_model": "h100-80gb-sxm5", "hbm_floor_gib": 70.0,
+               "pod_default": "H100-A", "aliases": ["H100"]},
 }
 
 MODELS = {
@@ -655,7 +659,8 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
 
     b = conf or BurstResult(sessions=0)
     return {
-        "outcome_id": OUTCOME_ID, "environment": ENVIRONMENT, "region_zone": "on-prem",
+        "outcome_id": OUTCOME_ID, "environment": args.environment,
+        "region_zone": args.region_zone,
         "instance_type_or_pod": args.pod_label or info.get("pod_default", "unlabelled"),
         "gpu_model": info.get("gpu_model_id", "unknown"),
         "gpu_count": info["gpu_count"], "model_id": model_cfg["model_id"],
@@ -773,7 +778,12 @@ def parse_args():
                     help="explicit weights dir per model, e.g. --model-path "
                          "qwen=/data/mirrors/qwen3.5-122b (repeatable)")
     ap.add_argument("--pod-label", default=None,
-                    help="manifest instance label; defaults per detected platform")
+                    help="manifest instance label (CSP SKU, e.g. p5e.48xlarge); "
+                         "defaults per detected platform")
+    ap.add_argument("--environment", default="wwt-atc", choices=VALID_ENVIRONMENTS,
+                    help="Appendix B environment value (default: wwt-atc)")
+    ap.add_argument("--region-zone", default="on-prem",
+                    help="cloud region+zone, e.g. us-east-1a ('on-prem' for ATC)")
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--stagger", type=float, default=0.25,
