@@ -81,10 +81,12 @@ EXPECTED_GPUS = 8
 # marketed capacity (decimal-GB marketing vs binary-GiB reporting, plus driver
 # reservation): it only needs to reject smaller SKUs or an active partition.
 PLATFORMS = {
+    # aliases: some ROCm torch builds return an empty device name and expose
+    # only the arch via gcnArchName (gfx942 = MI300-series).
     "H200":   {"gpu_model": "h200-141gb-sxm5", "hbm_floor_gib": 130.0,
-               "pod_default": "DGX-H200-A"},
+               "pod_default": "DGX-H200-A", "aliases": ["H200"]},
     "MI300X": {"gpu_model": "mi300x-192gb-oam", "hbm_floor_gib": 170.0,
-               "pod_default": "MI300X-A"},
+               "pod_default": "MI300X-A", "aliases": ["MI300X", "gfx942"]},
 }
 
 MODELS = {
@@ -173,15 +175,17 @@ def validate_setup(args):
     names, mems = set(), []
     for i in range(n):
         prop = torch.cuda.get_device_properties(i)
-        names.add(prop.name)
+        # name can be empty on some ROCm builds; gcnArchName carries the arch
+        names.add(f"{prop.name} {getattr(prop, 'gcnArchName', '')}".strip())
         mems.append(prop.total_memory / 1024**3)
     info["gpu_model_raw"] = sorted(names)
     if len(names) != 1:
         die(f"Mixed GPU models: {names}")
     name = names.pop()
-    plat = next((PLATFORMS[k] for k in PLATFORMS if k in name), None)
+    plat = next((PLATFORMS[k] for k in PLATFORMS
+                 if any(a in name for a in PLATFORMS[k]["aliases"])), None)
     if plat is None:
-        die(f"Unrecognised GPU '{name}' — expected one of {list(PLATFORMS)}")
+        die(f"Unrecognised GPU '{name}' — expected an alias of {list(PLATFORMS)}")
     info["gpu_model_id"] = plat["gpu_model"]
     info["pod_default"] = plat["pod_default"]
     ok.append(f"GPU model: {name} -> {plat['gpu_model']}")
