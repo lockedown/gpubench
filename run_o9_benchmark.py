@@ -2,7 +2,7 @@
 """
 O9 — Model cold-start time — HOST-side orchestrator
 ====================================================
-HSBC GPU Benchmark Methodology v1.3 | runs on the HOST (stdlib only, any
+GPU Benchmark Methodology v1.3 | runs on the HOST (stdlib only, any
 Python 3.8+; no GPU libraries needed here). Launches the in-container probe
 (o9_probe.py) per (model x cache-state x repeat), dropping the OS page cache
 for cold runs and metering actual NVMe bytes read via /proc/diskstats.

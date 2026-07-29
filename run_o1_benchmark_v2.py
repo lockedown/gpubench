@@ -2,7 +2,7 @@
 """
 O1 — KV cache memory scaling — execution harness
 ==================================================
-HSBC GPU Benchmark Methodology v1.3 | WWT ATC on-prem | Dell XE9680, 8x H200 SXM5
+GPU Benchmark Methodology v1.3 | WWT ATC on-prem + CSP | 8-GPU nodes (H200 / MI300X / H100)
 
 Implements the O1 key steps (v1.3 dual-ceiling model):
   * CLOSED-LOOP concurrency: N persistent workers each keep one request in
