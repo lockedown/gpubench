@@ -1,8 +1,8 @@
 # GPU Benchmark — Execution Harnesses (gpubench)
 
 Benchmark execution tooling for the ATC GPU benchmark engagement, implementing outcomes
-from the **GPU Benchmark Methodology v1.3** (O1 — KV cache memory scaling, O9 — model
-cold-start; further outcomes in development). Runs identically on the on-prem nodes
+from the **GPU Benchmark Methodology v1.3** (O1 — KV cache memory scaling, O2-lite —
+co-hosting isolation, O3-lite — quantization quality gate, O9 — model cold-start). Runs identically on the on-prem nodes
 (8× MI300X, 8× H200 DGX) and cloud (AWS p5e) — platform is auto-detected and every
 result row is emitted in the engagement's Appendix B manifest format.
 
@@ -17,6 +17,9 @@ result row is emitted in the engagement's Appendix B manifest format.
 | `run_o9_benchmark.py` | O9 orchestrator (`wwt-o9-harness/1.0`). Runs on the **host** (stdlib only, needs sudo for cold cells): drops page cache, meters NVMe bytes read, launches the probe per (model × cache-state × repeat). |
 | `o9_probe.py` | O9 in-container probe. Times import → engine build → first inference → first-100 latency curve. Launched by the orchestrator; not run directly. |
 | `test_o9.py` | Offline test suite for the O9 pair (fake docker/diskstats — runs anywhere, no GPUs). |
+| `run_o2_cohost.py` | O2-lite orchestrator (`wwt-o2-harness/1.0`). Runs on the **host** (stdlib): two models co-resident on shared GPUs (memory partition, TP4 each), served as endpoints; siloed ceilings → 50/50 → noisy-neighbour rotation → isolation scores. |
+| `run_o3_quality.py` | O3-lite quality gate (`wwt-o3lite-harness/1.0`). Runs on the **host**: serves each model (TP8) and runs lm-eval (GSM8K 8-shot, MMLU 5-shot) against the endpoint. Needs the `o3eval` derived image (Dockerfile in the script header). |
+| `test_o2_o3.py` | Offline test suite for O2-lite + O3-lite (fake SSE vLLM server + fake docker — no GPUs). |
 | `requirements.txt` | Python deps for a bare-metal (venv) install of the O1 harness. **Not needed for container execution** — the pinned vLLM image carries everything. |
 | `O1_Runbook_AWS_p5e.docx` | Runbook for executing O1 natively on AWS (EC2 p5e.48xlarge), per the customer-comparison scope. |
 
@@ -62,7 +65,7 @@ H200/DGX: identical commands with `--gpus all` replacing the AMD device flags
    → record as `container_image_sha` in manifests.
 2. **Check `harness_version` on every CSV row** before trusting a result — it is the
    tamper-evident guard against running a stale script (this has happened; the column
-   caught it). Current: O1 `1.3.4-kvdtype`, O9 `1.0`.
+   caught it). Current: O1 `1.3.4-kvdtype`, O2 `1.0`, O3-lite `1.0`, O9 `1.0`.
 3. **Detached execution only.** `docker run -d --name ...` (no `--rm`, no `-it`) or
    tmux. SSH/VPN drops have masqueraded as "node crashes" twice.
 4. **Resume is automatic.** Both harnesses append to CSV and skip completed cells on
@@ -93,7 +96,7 @@ H200/DGX: identical commands with `--gpus all` replacing the AMD device flags
 repo — **add it here**; both suites gate any harness change:
 
 ```bash
-python3 test_o9.py && python3 test_o1_harness.py
+python3 test_o9.py && python3 test_o2_o3.py && python3 test_o1_harness.py
 ```
 
 ## Known issues / open items
