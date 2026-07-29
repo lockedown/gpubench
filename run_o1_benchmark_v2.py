@@ -115,6 +115,11 @@ MODELS = {
         # DSv4 MLA (FlashMLA/AiterMLA) requires an explicit fp8 KV cache —
         # 'auto' asserts at load. Matches the harness KV math (1 B/entry).
         "engine_kwargs": {"kv_cache_dtype": "fp8"},
+        # DSv4 sparse-attention indexer on ROCm requires AITER kernels.
+        # Ignored on CUDA. Set only when this model's engine is built, so
+        # Qwen ROCm rows stay comparable with the AITER-less mini-sweep —
+        # if combining models in one invocation, list qwen BEFORE deepseek.
+        "engine_env": {"VLLM_ROCM_USE_AITER": "1"},
         # v1.2: extended cells for the 1M-context model
         "context_lengths": [2048, 8192, 32768, 65536, 131072, 262144, 524288, 1048576],
         "pinned_sha256": None,
@@ -377,6 +382,9 @@ def build_engine(model_cfg, max_len, block_size, tp):
         trust_remote_code=True,
         **(model_cfg.get("engine_kwargs") or {}),   # per-model requirements
     )
+    for k, v in (model_cfg.get("engine_env") or {}).items():
+        os.environ.setdefault(k, v)   # spawned engine workers inherit this
+        log(f"  engine env: {k}={os.environ[k]}")
     return AsyncLLMEngine.from_engine_args(ea)
 
 
@@ -698,7 +706,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "repeats_completed": reps, "coefficient_of_variation": round(cov, 4),
         "cov_pass": cov <= COV_LIMIT,
         "serving_stack": f"vllm-on-instance/{info.get('vllm_version','?')}",
-        "harness_version": "wwt-o1-harness/1.3.1-dskv",
+        "harness_version": "wwt-o1-harness/1.3.2-aiter",
         "driver_version": info.get("driver_version", ""),
         "torch_version": info.get("torch_version", ""),
         "run_start_utc": started,
@@ -706,7 +714,10 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "operator": args.operator,
         "notes": f"kv-derivation={kv_note}; ttft_bound={TTFT_CEILING_MS}ms; "
                  f"itl_health=3x{round(itl_solo_p99,1)}ms; stagger={args.stagger}s; "
-                 f"profile={args.profile}; methodology=v1.3" + trim_note + borderline
+                 f"profile={args.profile}; methodology=v1.3"
+                 + (f"; engine_env={model_cfg.get('engine_env')}" if model_cfg.get("engine_env") else "")
+                 + (f"; engine_kwargs={model_cfg.get('engine_kwargs')}" if model_cfg.get("engine_kwargs") else "")
+                 + trim_note + borderline
                  + (f"; ERROR={b.error}" if b.error else ""),
     }
 
