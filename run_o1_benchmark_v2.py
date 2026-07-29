@@ -120,6 +120,10 @@ MODELS = {
         # Qwen ROCm rows stay comparable with the AITER-less mini-sweep —
         # if combining models in one invocation, list qwen BEFORE deepseek.
         "engine_env": {"VLLM_ROCM_USE_AITER": "1"},
+        # DSv4 groups MLA-layer KV with the sparse-indexer cache; forcing a
+        # small block violates vLLM's uniform page-size assert. The MLA
+        # backend must pick its own block size -> block sweep n/a here.
+        "force_engine_default_block": True,
         # v1.2: extended cells for the 1M-context model
         "context_lengths": [2048, 8192, 32768, 65536, 131072, 262144, 524288, 1048576],
         "pinned_sha256": None,
@@ -367,6 +371,14 @@ class BurstResult:
         return self.p(self.ttft_ms, 0.99)
 
 
+def kv_mode_str(block_size):
+    if block_size is None:
+        return ("paged-engine-default (DSv4 MLA/indexer page-size constraint; "
+                "block sweep n/a; non-paged cell covered by TRT-LLM run)")
+    return (f"paged-block{block_size} (vLLM cannot disable paging; "
+            f"non-paged cell covered by TRT-LLM run)")
+
+
 def build_engine(model_cfg, max_len, block_size, tp):
     """Start a vLLM async engine. API guarded — pin the vLLM version per Appendix A."""
     from vllm import AsyncEngineArgs
@@ -375,7 +387,7 @@ def build_engine(model_cfg, max_len, block_size, tp):
         model=model_cfg["local_path"],
         tensor_parallel_size=tp,
         max_model_len=max_len,
-        block_size=block_size,
+        **({} if block_size is None else {"block_size": block_size}),
         gpu_memory_utilization=0.92,
         enable_prefix_caching=False,   # prefix reuse would fake KV scaling
         disable_log_stats=False,
@@ -690,8 +702,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "model_sha256": model_cfg.get("pinned_sha256") or "unpinned",
         "precision": model_cfg["precision"], "scenario": "server",
         "context_length_tokens": ctx,
-        "kv_mode": f"paged-block{block_size} (vLLM cannot disable paging; "
-                   f"non-paged cell covered by TRT-LLM run)",
+        "kv_mode": kv_mode_str(block_size),
         "concurrent_sessions": slo,
         "concurrent_sessions_memory": mem,
         "memory_ceiling_reason": mem_reason,
@@ -706,7 +717,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "repeats_completed": reps, "coefficient_of_variation": round(cov, 4),
         "cov_pass": cov <= COV_LIMIT,
         "serving_stack": f"vllm-on-instance/{info.get('vllm_version','?')}",
-        "harness_version": "wwt-o1-harness/1.3.2-aiter",
+        "harness_version": "wwt-o1-harness/1.3.3-dsblock",
         "driver_version": info.get("driver_version", ""),
         "torch_version": info.get("torch_version", ""),
         "run_start_utc": started,
@@ -748,19 +759,21 @@ async def main_async(args, info):
         ctxs = args.context_lengths or m["context_lengths"]
         tokenizer = AutoTokenizer.from_pretrained(m["local_path"], trust_remote_code=True)
         mpe = model_max_positions(m["local_path"])
-        for block in args.block_sizes:
+        block_list = ([None] if m.get("force_engine_default_block")
+                      else args.block_sizes)
+        for block in block_list:
             max_len = max(ctxs) + args.out_headroom
             if mpe and max_len > mpe:
                 log(f"── max_model_len capped {max_len} -> {mpe} "
                     f"(model max_position_embeddings; top-of-sweep prompts are "
                     f"trimmed by out_tokens rather than overriding the limit)")
                 max_len = mpe
-            log(f"── engine: {m['hf_id']}  TP{args.tp}  max_len={max_len}  block={block}")
+            log(f"── engine: {m['hf_id']}  TP{args.tp}  max_len={max_len}  "
+                f"block={block if block is not None else 'engine-default'}")
             engine = build_engine(m, max_len, block, args.tp)
             try:
                 for ctx in ctxs:
-                    kv_mode = (f"paged-block{block} (vLLM cannot disable paging; "
-                               f"non-paged cell covered by TRT-LLM run)")
+                    kv_mode = kv_mode_str(block)
                     if (m["model_id"], str(ctx), kv_mode) in skip:
                         log(f"  ctx={ctx} block={block}: already in CSV — skipped")
                         continue
