@@ -112,6 +112,9 @@ MODELS = {
         "model_id": "deepseek-v4-flash",
         "hf_id": "deepseek-ai/DeepSeek-V4-Flash",
         "precision": "fp4-fp8-mixed",
+        # DSv4 MLA (FlashMLA/AiterMLA) requires an explicit fp8 KV cache —
+        # 'auto' asserts at load. Matches the harness KV math (1 B/entry).
+        "engine_kwargs": {"kv_cache_dtype": "fp8"},
         # v1.2: extended cells for the 1M-context model
         "context_lengths": [2048, 8192, 32768, 65536, 131072, 262144, 524288, 1048576],
         "pinned_sha256": None,
@@ -372,6 +375,7 @@ def build_engine(model_cfg, max_len, block_size, tp):
         enable_prefix_caching=False,   # prefix reuse would fake KV scaling
         disable_log_stats=False,
         trust_remote_code=True,
+        **(model_cfg.get("engine_kwargs") or {}),   # per-model requirements
     )
     return AsyncLLMEngine.from_engine_args(ea)
 
@@ -694,7 +698,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "repeats_completed": reps, "coefficient_of_variation": round(cov, 4),
         "cov_pass": cov <= COV_LIMIT,
         "serving_stack": f"vllm-on-instance/{info.get('vllm_version','?')}",
-        "harness_version": "wwt-o1-harness/1.3-searchfix",
+        "harness_version": "wwt-o1-harness/1.3.1-dskv",
         "driver_version": info.get("driver_version", ""),
         "torch_version": info.get("torch_version", ""),
         "run_start_utc": started,
