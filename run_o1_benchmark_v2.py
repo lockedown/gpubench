@@ -501,7 +501,10 @@ def kv_bytes_per_token_from_config(model_cfg):
             raw = json.load(f)
         hf = {**raw, **(raw.get("text_config") or {})}
         layers = hf["num_hidden_layers"]
-        dsz = 2 if "bf16" in model_cfg["precision"] else 1
+        # KV entry size follows the ENGINE's kv-cache dtype, not the weight
+        # precision: weights-fp8 models still hold bf16 KV under 'auto'.
+        kv_dtype = (model_cfg.get("engine_kwargs") or {}).get("kv_cache_dtype", "auto")
+        dsz = 1 if str(kv_dtype).startswith("fp8") else 2
         if hf.get("kv_lora_rank"):   # MLA: compressed latent replaces K/V heads
             per = layers * (hf["kv_lora_rank"] + hf.get("qk_rope_head_dim", 0)) * dsz
             return per, "mla"
@@ -717,7 +720,7 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "repeats_completed": reps, "coefficient_of_variation": round(cov, 4),
         "cov_pass": cov <= COV_LIMIT,
         "serving_stack": f"vllm-on-instance/{info.get('vllm_version','?')}",
-        "harness_version": "wwt-o1-harness/1.3.3-dsblock",
+        "harness_version": "wwt-o1-harness/1.3.4-kvdtype",
         "driver_version": info.get("driver_version", ""),
         "torch_version": info.get("torch_version", ""),
         "run_start_utc": started,
