@@ -26,7 +26,7 @@ import argparse, csv, http.client, json, os, statistics, subprocess, sys  # noqa
 import threading, time  # noqa: E401
 from datetime import datetime, timezone
 
-HARNESS_VERSION = "wwt-o2-harness/1.0"
+HARNESS_VERSION = "wwt-o2-harness/1.1-drain"
 TTFT_BOUND_MS = 1500.0
 RAMP_BUDGET_S = 20.0
 WINDOW_S = 45.0                      # steady-state capture per probe/phase
@@ -190,12 +190,35 @@ def wait_ready(port, timeout_s):
         time.sleep(10)
     return False
 
+def dump_logs(name, n=40):
+    try:
+        out = subprocess.run(["docker", "logs", "--tail", str(n), name],
+                             capture_output=True, text=True, timeout=30)
+        log(f"── last {n} log lines from {name}:")
+        for line in (out.stdout + out.stderr).splitlines()[-n:]:
+            print("   " + line)
+    except Exception:  # noqa: BLE001
+        pass
+
+def drain(seconds):
+    if seconds > 0:
+        log(f"  draining GPU memory ({seconds}s)")
+        time.sleep(seconds)
+
 def stop_all(names):
     for n in names:
         subprocess.run(["docker", "rm", "-f", n],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ── main flow ──────────────────────────────────────────────────────────────────
+def write_row(args, row):
+    new = not os.path.exists(args.out)
+    with open(args.out, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
 def emit(args, rows, topology, key, role, workers, ceiling, burst,
          baseline_p99=None):
     p99 = round(pctl(burst.ttft, 0.99), 1) if burst.ttft else ""
@@ -220,6 +243,7 @@ def emit(args, rows, topology, key, role, workers, ceiling, burst,
                  f"co-tenancy via memory partition (CPX topology deferred to O4); "
                  f"errors={burst.errors}",
     })
+    write_row(args, rows[-1])   # persist immediately — aborts must not lose data
 
 def main():
     ap = argparse.ArgumentParser(description="O2-lite co-hosting (host)")
@@ -239,6 +263,8 @@ def main():
     ap.add_argument("--region-zone", default="on-prem")
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
     ap.add_argument("--nvidia", action="store_true")
+    ap.add_argument("--drain-wait", type=int, default=45,
+                    help="seconds to wait for VRAM release between phases")
     args = ap.parse_args()
     a_key, b_key = [x.strip() for x in args.pair.split(",")]
     ports = {a_key: 8801, b_key: 8802}
@@ -251,12 +277,14 @@ def main():
             log(f"── siloed: {key}")
             start_serve(args, key, names[key], ports[key])
             if not wait_ready(ports[key], args.ready_timeout):
-                sys.exit(f"{key} never became ready")
+                dump_logs(names[key])
+                sys.exit(f"{key} never became ready — container logs above")
             c, b = find_ceiling(ports[key], key, args.out_tokens, args.max_workers)
             ceilings[key] = max(c, 1)
             emit(args, rows, "siloed", key, "alone", c, c, b)
             log(f"  {key} siloed ceiling = {c}")
             stop_all([names[key]])
+            drain(args.drain_wait)
 
         # Phase 3 — both up, 50/50
         log("── co-host: starting both")
@@ -264,7 +292,8 @@ def main():
             start_serve(args, key, names[key], ports[key])
         for key in (a_key, b_key):
             if not wait_ready(ports[key], args.ready_timeout):
-                sys.exit(f"{key} never became ready (co-host)")
+                dump_logs(names[key])
+                sys.exit(f"{key} never became ready (co-host) — logs above")
         half = {k: max(1, round(0.5 * ceilings[k])) for k in (a_key, b_key)}
         base_p99 = {}
         log(f"── co-host 50/50: {a_key}={half[a_key]}, {b_key}={half[b_key]} workers")
@@ -303,12 +332,6 @@ def main():
     finally:
         stop_all(list(names.values()))
 
-    new = not os.path.exists(args.out)
-    with open(args.out, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if new:
-            w.writeheader()
-        w.writerows(rows)
     log(f"O2 complete — {len(rows)} rows -> {args.out}")
 
 if __name__ == "__main__":
