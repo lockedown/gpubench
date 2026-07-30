@@ -26,7 +26,7 @@ import argparse, csv, http.client, json, os, statistics, subprocess, sys  # noqa
 import threading, time  # noqa: E401
 from datetime import datetime, timezone
 
-HARNESS_VERSION = "wwt-o2-harness/1.1-drain"
+HARNESS_VERSION = "wwt-o2-harness/1.2-cumulative"
 TTFT_BOUND_MS = 1500.0
 RAMP_BUDGET_S = 20.0
 WINDOW_S = 45.0                      # steady-state capture per probe/phase
@@ -152,7 +152,7 @@ def snapshot_dir(cache_dir, key):
     return f"/root/.cache/huggingface/hub/{MODELS[key]['hub']}/snapshots/" + \
         sorted(os.listdir(base))[-1]
 
-def start_serve(args, key, name, port):
+def start_serve(args, key, name, port, util):
     m = MODELS[key]
     dev = (["--gpus", "all", "-e", f"CUDA_VISIBLE_DEVICES={args.gpus}"]
            if args.nvidia else
@@ -169,7 +169,7 @@ def start_serve(args, key, name, port):
            snapshot_dir(args.cache_dir, key),
            "--served-model-name", key,
            "--tensor-parallel-size", str(args.tp),
-           "--gpu-memory-utilization", str(args.mem_frac),
+           "--gpu-memory-utilization", str(util),
            "--max-model-len", "4096", "--port", str(port)]
     subprocess.run(["docker", "rm", "-f", name],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -275,7 +275,7 @@ def main():
         # Phase 1+2 — siloed ceilings (same mem_frac as co-hosting, for fairness)
         for key in (a_key, b_key):
             log(f"── siloed: {key}")
-            start_serve(args, key, names[key], ports[key])
+            start_serve(args, key, names[key], ports[key], args.mem_frac)
             if not wait_ready(ports[key], args.ready_timeout):
                 dump_logs(names[key])
                 sys.exit(f"{key} never became ready — container logs above")
@@ -286,11 +286,14 @@ def main():
             stop_all([names[key]])
             drain(args.drain_wait)
 
-        # Phase 3 — both up, 50/50
-        log("── co-host: starting both")
+        # Phase 3 — both up, 50/50. Sequential start, cumulative utilization:
+        # tenant A capped at mem_frac of total; tenant B capped at 2*mem_frac
+        # of total, i.e. an equal absolute share on top of A's footprint.
+        log("── co-host: starting tenants sequentially (cumulative util)")
+        utils = {a_key: args.mem_frac,
+                 b_key: min(round(2 * args.mem_frac, 2), 0.95)}
         for key in (a_key, b_key):
-            start_serve(args, key, names[key], ports[key])
-        for key in (a_key, b_key):
+            start_serve(args, key, names[key], ports[key], utils[key])
             if not wait_ready(ports[key], args.ready_timeout):
                 dump_logs(names[key])
                 sys.exit(f"{key} never became ready (co-host) — logs above")
