@@ -8,14 +8,18 @@ endpoint: GSM8K 8-shot (generative) + MMLU 5-shot (loglikelihood). Pairs with
 the O1 capacity data to complete the per-platform precision verdict
 (e.g. "FP8 costs 17% capacity on MI300X — does it also cost accuracy?").
 
-One-time derived image (keeps the pinning discipline — never pip into a
-running benchmark container):
+One-time eval image (keeps the pinning discipline — never pip into a
+running benchmark container). Do NOT base this on the vLLM image: its
+transformers is too new for lm-eval 0.4.9 (AutoModelForVision2Seq removed ->
+import-time crash), and with tokenized_requests=False the eval container
+needs no vLLM/tokenizer/GPU anyway:
 
     cat > Dockerfile.o3eval <<'EOF'
-    FROM <pinned-vllm-image>
-    RUN pip install "lm-eval[api]==0.4.9"
+    FROM python:3.12-slim
+    RUN pip install --no-cache-dir "lm-eval[api]==0.4.9" "transformers<5"
     EOF
     sudo docker build -f Dockerfile.o3eval -t wwt/vllm-bench:o3eval .
+    # smoke: docker run --rm --entrypoint lm_eval wwt/vllm-bench:o3eval --help
 
 Run:  python3 run_o3_quality.py --serve-image <pinned> \\
           --eval-image wwt/vllm-bench:o3eval --models qwen,qwen-fp8 \\
@@ -29,7 +33,7 @@ O3 campaign.
 import argparse, csv, glob, json, os, subprocess, sys, time  # noqa: E401
 from datetime import datetime, timezone
 
-HARNESS_VERSION = "wwt-o3lite-harness/1.0"
+HARNESS_VERSION = "wwt-o3lite-harness/1.1-localtok"
 MODELS = {
     "qwen":     {"model_id": "qwen3.5-122b-a10b", "precision": "bf16",
                  "hub": "models--Qwen--Qwen3.5-122B-A10B", "serve_args": [], "env": {}},
@@ -93,12 +97,19 @@ def wait_ready(port, timeout_s):
     return False
 
 def run_eval(args, key, task, shots, limit, port, outdir):
+    # lm-eval instantiates a HF tokenizer even with tokenized_requests=False
+    # (context accounting; required for loglikelihood tasks like MMLU). Point
+    # it at the local snapshot and mount the cache — no hub lookups.
+    tok = snapshot_dir(args.cache_dir, key)
     cmd = ["docker", "run", "--rm", "--network", "host",
-           "-v", f"{args.workdir}:/work", "-w", "/work", "--entrypoint", "lm_eval",
+           "-v", f"{args.workdir}:/work",
+           "-v", f"{args.cache_dir}:/root/.cache/huggingface",
+           "-w", "/work", "--entrypoint", "lm_eval",
            args.eval_image,
            "--model", "local-completions",
            "--model_args", (f"model={key},base_url=http://127.0.0.1:{port}/v1/"
-                            f"completions,num_concurrent=8,max_retries=3,"
+                            f"completions,tokenizer={tok},"
+                            f"num_concurrent=8,max_retries=3,"
                             f"tokenized_requests=False"),
            "--tasks", task, "--num_fewshot", str(shots),
            "--limit", str(limit), "--output_path", f"/work/{outdir}",
