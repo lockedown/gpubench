@@ -20,7 +20,7 @@ sudo (HOME=/root) can no longer lose the probe.
 import argparse, csv, json, os, subprocess, sys, time  # noqa: E401
 from datetime import datetime, timezone
 
-HARNESS_VERSION = "wwt-o9-harness/1.2-localprobe"
+HARNESS_VERSION = "wwt-o9-harness/1.3-quiesce"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS = {
     "qwen":     "models--Qwen--Qwen3.5-122B-A10B",
@@ -83,6 +83,38 @@ def done_cells(path):
         return {(r["model_id"], r["cache_state"], r["repeat"])
                 for r in csv.DictReader(f)}
 
+def wait_gpu_quiesce(nvidia, timeout_s=180, threshold_mb=2048):
+    """Block until all GPUs are near-empty (previous cell/container fully
+    released) — engine startup memory profiling fails opaquely otherwise.
+    Skips with a warning if the SMI tool is unavailable on the host."""
+    if nvidia:
+        cmd = ["nvidia-smi", "--query-gpu=memory.used",
+               "--format=csv,noheader,nounits"]
+        parse = lambda out: [int(x) for x in out.split()]  # noqa: E731
+    else:
+        cmd = ["rocm-smi", "--showmemuse", "--csv"]
+        parse = lambda out: [int(line.split(",")[1])  # noqa: E731
+                             for line in out.strip().splitlines()[1:]
+                             if "," in line]
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=30).stdout
+            used = parse(out)
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError,
+                IndexError):
+            log("quiesce check: SMI unavailable/unparseable on host — skipping")
+            return
+        if used and max(used) < threshold_mb:
+            return
+        log(f"waiting for GPUs to quiesce (max used {max(used) if used else '?'}"
+            f" MB >= {threshold_mb} MB)...")
+        time.sleep(10)
+    log(f"WARNING: GPUs not quiesced after {timeout_s}s — proceeding anyway; "
+        "if the engine fails to start, check for leftover containers "
+        "(docker ps) or another harness running on this node")
+
 def main():
     ap = argparse.ArgumentParser(description="O9 cold-start orchestrator (host)")
     ap.add_argument("--image", required=True)
@@ -127,6 +159,7 @@ def main():
                     log(f"{key}/{state}/r{rep}: already in CSV — skipped")
                     continue
                 log(f"── {key} | {state} | repeat {rep}")
+                wait_gpu_quiesce(args.nvidia)
                 if state == "cold":
                     drop_caches()
                 probe_out = f"o9_probe_{key}_{state}_{rep}.json"

@@ -15,7 +15,7 @@ result row is emitted in the engagement's Appendix B manifest format.
 | File | What it is |
 |---|---|
 | `run_o1_benchmark_v2.py` | O1 harness (`wwt-o1-harness/1.3.4-kvdtype`). Closed-loop dual-ceiling search: interactive (SLO) ceiling at P99 TTFT ≤ 1.5s + memory ceiling, per (model × context × KV-mode) cell. Runs **inside** the pinned vLLM container. |
-| `run_o9_benchmark.py` | O9 orchestrator (`wwt-o9-harness/1.2-localprobe`). Runs on the **host** (stdlib only, needs sudo for cold cells): drops page cache, meters NVMe bytes read, launches the probe per (model × cache-state × repeat). Resolves `o9_probe.py` from its own directory (bind-mounted into the container) — workdir is outputs-only. |
+| `run_o9_benchmark.py` | O9 orchestrator (`wwt-o9-harness/1.3-quiesce`). Runs on the **host** (stdlib only, needs sudo for cold cells): waits for GPUs to quiesce, drops page cache, meters NVMe bytes read, launches the probe per (model × cache-state × repeat). Resolves `o9_probe.py` from its own directory (bind-mounted into the container) — workdir is outputs-only. |
 | `o9_probe.py` | O9 in-container probe. Times import → engine build → first inference → first-100 latency curve. Launched by the orchestrator; not run directly. |
 | `test_o9.py` | Offline test suite for the O9 pair (fake docker/diskstats — runs anywhere, no GPUs). |
 | `run_o2_cohost.py` | O2-lite orchestrator (`wwt-o2-harness/1.3-crossvendor`). Runs on the **host** (stdlib): two models co-resident on shared GPUs (memory partition, TP4 each), served as endpoints; siloed ceilings → 50/50 → noisy-neighbour rotation → isolation scores. Same-GPU co-residency proved unconfigurable on the ROCm dev build (V1 memory pre-check) — the CUDA engine (0.22.1) may permit it; co-host phases are worth re-attempting on the DGX. |
@@ -82,14 +82,20 @@ not the workdir. AWS: see the p5e runbook docx.
 2. **Check `harness_version` on every CSV row** before trusting a result — it is the
    tamper-evident guard against running a stale script (this has happened; the column
    caught it). Current: O1 `1.3.4-kvdtype`, O2 `1.3-crossvendor`, O3-lite
-   `1.2-crossvendor`, O9 `1.2-localprobe`.
-3. **Detached execution only.** `docker run -d --name ...` (no `--rm`, no `-it`) or
+   `1.2-crossvendor`, O9 `1.3-quiesce`.
+3. **One harness per node at a time.** O1/O2/O3/O9 all assume an exclusive,
+   quiesced node — overlapping them (or launching before the previous cell's
+   container releases GPU memory) kills engine startup with an opaque
+   "Engine core initialization failed". O9 now waits for GPUs to drain
+   between cells; for the others, check `nvidia-smi`/`rocm-smi` shows ~0 MB
+   used and `docker ps` shows no serve containers before launching.
+4. **Detached execution only.** `docker run -d --name ...` (no `--rm`, no `-it`) or
    tmux. SSH/VPN drops have masqueraded as "node crashes" twice.
-4. **Resume is automatic.** Both harnesses append to CSV and skip completed cells on
+5. **Resume is automatic.** Both harnesses append to CSV and skip completed cells on
    re-launch — after any failure, re-run the identical command.
-5. **No live downloads during measurement** (`HF_HUB_OFFLINE=1` is forced). Mirror
+6. **No live downloads during measurement** (`HF_HUB_OFFLINE=1` is forced). Mirror
    weights beforehand into `/opt/huggingface-cache`.
-6. **Model-specific engine requirements are encoded in the harness**, not in runbooks
+7. **Model-specific engine requirements are encoded in the harness**, not in runbooks
    or memory: DeepSeek-V4 needs fp8 KV cache + `VLLM_ROCM_USE_AITER=1` (ROCm) +
    engine-default KV block size. Rows record these in `notes`. Under `--nvidia`,
    ROCm-specific env (`VLLM_ROCM_*`) is dropped automatically (O2/O3/O9; O1
