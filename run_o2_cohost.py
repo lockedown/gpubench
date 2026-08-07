@@ -15,8 +15,14 @@ gpu-memory-utilization split), served as OpenAI endpoints. Phases:
   5. noisy B    — rotated
 Isolation score (v1.3 page-3): victim P99 under pressure / victim P99 at 50/50.
 
-  sudo python3 run_o2_cohost.py --image vllm/vllm-openai-rocm:nightly \
+  sudo python3 run_o2_cohost.py --image <pinned-rocm-digest> \
       --pair qwen-fp8,deepseek --operator <you> --out o2_results.csv
+
+NVIDIA (H200/DGX): add --nvidia and use the CUDA image; ROCm-specific model
+env (VLLM_ROCM_*) is dropped automatically:
+
+  sudo python3 run_o2_cohost.py --nvidia --image wwt/vllm-bench:o1 \
+      --pair qwen-fp8,qwen --gpus 0,1,2,3 --operator <you> --out o2_results.csv
 
 Scope caveat (recorded per row): this is co-tenancy via memory partition on
 shared GPUs — the closest legal topology on MI300X without CPX partitioning
@@ -26,7 +32,7 @@ import argparse, csv, http.client, json, os, statistics, subprocess, sys  # noqa
 import threading, time  # noqa: E401
 from datetime import datetime, timezone
 
-HARNESS_VERSION = "wwt-o2-harness/1.2-cumulative"
+HARNESS_VERSION = "wwt-o2-harness/1.3-crossvendor"
 TTFT_BOUND_MS = 1500.0
 RAMP_BUDGET_S = 20.0
 WINDOW_S = 45.0                      # steady-state capture per probe/phase
@@ -161,7 +167,9 @@ def start_serve(args, key, name, port, util):
             "--security-opt", "seccomp=unconfined", "--cap-add=SYS_PTRACE",
             "-e", f"HIP_VISIBLE_DEVICES={args.gpus}",
             "-e", f"ROCR_VISIBLE_DEVICES={args.gpus}"])
-    env = sum((["-e", f"{k}={v}"] for k, v in m["env"].items()), [])
+    env_items = {k: v for k, v in m["env"].items()
+                 if not (args.nvidia and k.startswith("VLLM_ROCM"))}
+    env = sum((["-e", f"{k}={v}"] for k, v in env_items.items()), [])
     cmd = ["docker", "run", "-d", "--name", name, "--network", "host",
            "--ipc=host", "--shm-size=32g", *dev, *env,
            "-v", f"{args.cache_dir}:/root/.cache/huggingface",
@@ -258,7 +266,8 @@ def main():
     ap.add_argument("--ready-timeout", type=int, default=2400)
     ap.add_argument("--cache-dir", default="/opt/huggingface-cache")
     ap.add_argument("--out", default="o2_results.csv")
-    ap.add_argument("--pod-label", default="MI300X-A")
+    ap.add_argument("--pod-label", default=None,
+                    help="defaults to MI300X-A, or DGX-H200-A with --nvidia")
     ap.add_argument("--environment", default="wwt-atc")
     ap.add_argument("--region-zone", default="on-prem")
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
@@ -266,6 +275,8 @@ def main():
     ap.add_argument("--drain-wait", type=int, default=45,
                     help="seconds to wait for VRAM release between phases")
     args = ap.parse_args()
+    if args.pod_label is None:
+        args.pod_label = "DGX-H200-A" if args.nvidia else "MI300X-A"
     a_key, b_key = [x.strip() for x in args.pair.split(",")]
     ports = {a_key: 8801, b_key: 8802}
     names = {a_key: "o2a", b_key: "o2b"}

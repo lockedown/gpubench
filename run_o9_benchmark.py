@@ -13,11 +13,15 @@ for cold runs and metering actual NVMe bytes read via /proc/diskstats.
 sudo is required for cache drops (cold cells). Runs are sequential and
 foreground; use tmux. Resume-safe: completed (model,cache_state,repeat)
 cells are skipped. AMD device flags default; --nvidia switches them.
+o9_probe.py is resolved from THE SAME DIRECTORY as this script (bind-mounted
+into the container) — workdir is only for CSV/JSON outputs, so running under
+sudo (HOME=/root) can no longer lose the probe.
 """
 import argparse, csv, json, os, subprocess, sys, time  # noqa: E401
 from datetime import datetime, timezone
 
-HARNESS_VERSION = "wwt-o9-harness/1.0"
+HARNESS_VERSION = "wwt-o9-harness/1.2-localprobe"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS = {
     "qwen":     "models--Qwen--Qwen3.5-122B-A10B",
     "qwen-fp8": "models--Qwen--Qwen3.5-122B-A10B-FP8",
@@ -64,7 +68,9 @@ def docker_cmd(args, key, probe_out):
             "--security-opt", "seccomp=unconfined", "--cap-add=SYS_PTRACE"])
     return (["docker", "run", "--rm", "--ipc=host", "--shm-size=32g", *dev,
              "-v", f"{args.cache_dir}:/root/.cache/huggingface",
-             "-v", f"{args.workdir}:/work", "-w", "/work",
+             "-v", f"{args.workdir}:/work",
+             "-v", f"{os.path.join(SCRIPT_DIR, 'o9_probe.py')}:/work/o9_probe.py:ro",
+             "-w", "/work",
              "-e", "HF_HUB_OFFLINE=1", "--entrypoint", "python3", args.image,
              "o9_probe.py", "--model-path", snapshot_dir(args.cache_dir, key),
              "--model-key", key, "--tp", str(args.tp),
@@ -87,14 +93,20 @@ def main():
     ap.add_argument("--cache-dir", default="/opt/huggingface-cache")
     ap.add_argument("--workdir", default=os.path.expanduser("~/dl_script/gpubench"))
     ap.add_argument("--out", default="o9_results.csv")
-    ap.add_argument("--pod-label", default="MI300X-A")
+    ap.add_argument("--pod-label", default=None,
+                    help="defaults to MI300X-A, or DGX-H200-A with --nvidia")
     ap.add_argument("--environment", default="wwt-atc")
     ap.add_argument("--region-zone", default="on-prem")
     ap.add_argument("--operator", default=os.environ.get("SUDO_USER") or
                     os.environ.get("USER", "unknown"))
     ap.add_argument("--nvidia", action="store_true",
                     help="use --gpus all instead of AMD device flags")
+    ap.add_argument("--keep-json", action="store_true",
+                    help="keep per-cell probe JSONs (default: consolidate into "
+                         "o9_curves.jsonl and delete)")
     args = ap.parse_args()
+    if args.pod_label is None:
+        args.pod_label = "DGX-H200-A" if args.nvidia else "MI300X-A"
     models = [m.strip() for m in args.models.split(",")]
     states = [s.strip() for s in args.cache_states.split(",")]
     for m in models:
@@ -102,8 +114,9 @@ def main():
             sys.exit(f"unknown model {m}")
     if "cold" in states and os.geteuid() != 0:
         sys.exit("cold cells need root for drop_caches — run under sudo")
-    if not os.path.exists(os.path.join(args.workdir, "o9_probe.py")):
-        sys.exit(f"o9_probe.py not found in {args.workdir}")
+    if not os.path.exists(os.path.join(SCRIPT_DIR, "o9_probe.py")):
+        sys.exit(f"o9_probe.py not found next to this script ({SCRIPT_DIR}) — "
+                 "keep the pair together")
 
     skip = done_cells(os.path.join(args.workdir, args.out))
     out_path = os.path.join(args.workdir, args.out)
@@ -155,8 +168,16 @@ def main():
                     if new:
                         w.writeheader()
                     w.writerow(row)
+                # consolidate the first-100 curve into one JSONL, drop the
+                # per-cell probe file (methodology keeps the curve; the CSV
+                # keeps the aggregates; nobody needs 12 loose JSON files)
+                with open(os.path.join(args.workdir, "o9_curves.jsonl"), "a") as cf:
+                    cf.write(json.dumps({"cell": f"{key}/{state}/r{rep}",
+                                         "infer_ms": [round(x) for x in lat]}) + "\n")
+                if not args.keep_json:
+                    os.remove(os.path.join(args.workdir, probe_out))
                 log(f"  ready={p['total_ready_s']}s first={p['first_infer_ms']}ms "
-                    f"read={gb:.1f}GB -> {args.out}")
+                    f"read={gb:.1f}GB -> {args.out} (+curve -> o9_curves.jsonl)")
     log("O9 sweep complete")
 
 if __name__ == "__main__":

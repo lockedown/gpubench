@@ -33,7 +33,7 @@ O3 campaign.
 import argparse, csv, glob, json, os, subprocess, sys, time  # noqa: E401
 from datetime import datetime, timezone
 
-HARNESS_VERSION = "wwt-o3lite-harness/1.1-localtok"
+HARNESS_VERSION = "wwt-o3lite-harness/1.2-crossvendor"
 MODELS = {
     "qwen":     {"model_id": "qwen3.5-122b-a10b", "precision": "bf16",
                  "hub": "models--Qwen--Qwen3.5-122B-A10B", "serve_args": [], "env": {}},
@@ -68,7 +68,9 @@ def start_serve(args, key, port):
            ["--device=/dev/kfd", "--device=/dev/dri",
             "--group-add", "video", "--group-add", "render",
             "--security-opt", "seccomp=unconfined", "--cap-add=SYS_PTRACE"])
-    env = sum((["-e", f"{k}={v}"] for k, v in m["env"].items()), [])
+    env_items = {k: v for k, v in m["env"].items()
+                 if not (args.nvidia and k.startswith("VLLM_ROCM"))}
+    env = sum((["-e", f"{k}={v}"] for k, v in env_items.items()), [])
     subprocess.run(["docker", "rm", "-f", "o3serve"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["docker", "run", "-d", "--name", "o3serve", "--network", "host",
@@ -140,12 +142,15 @@ def main():
     ap.add_argument("--cache-dir", default="/opt/huggingface-cache")
     ap.add_argument("--workdir", default=os.path.expanduser("~/dl_script/gpubench"))
     ap.add_argument("--out", default="o3_quality.csv")
-    ap.add_argument("--pod-label", default="MI300X-A")
+    ap.add_argument("--pod-label", default=None,
+                    help="defaults to MI300X-A, or DGX-H200-A with --nvidia")
     ap.add_argument("--environment", default="wwt-atc")
     ap.add_argument("--region-zone", default="on-prem")
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
     ap.add_argument("--nvidia", action="store_true")
     args = ap.parse_args()
+    if args.pod_label is None:
+        args.pod_label = "DGX-H200-A" if args.nvidia else "MI300X-A"
     models = [m.strip() for m in args.models.split(",")]
     out_path = os.path.join(args.workdir, args.out)
     done = set()
