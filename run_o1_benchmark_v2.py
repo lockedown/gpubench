@@ -2,7 +2,7 @@
 """
 O1 — KV cache memory scaling — execution harness
 ==================================================
-GPU Benchmark Methodology v1.3 | WWT ATC on-prem + CSP | 8-GPU nodes (H200 / MI300X / H100)
+GPU Benchmark Methodology v1.3 | WWT ATC on-prem + CSP | 8-GPU nodes (H200 / B200 / B300 / MI300X / H100)
 
 Implements the O1 key steps (v1.3 dual-ceiling model):
   * CLOSED-LOOP concurrency: N persistent workers each keep one request in
@@ -33,10 +33,13 @@ Plus:
     3-repeat / CoV <= 5% rule (page 3 of the methodology).
 
 Usage:
-  python run_o1_benchmark.py --validate-only
-  python run_o1_benchmark.py --models qwen --profile quick          # smoke run
-  python run_o1_benchmark.py --profile methodology --out o1_results.csv
-  python run_o1_benchmark.py --models deepseek --context-lengths 2048,8192
+  python run_o1_benchmark_v2.py --validate-only
+  python run_o1_benchmark_v2.py --models qwen --profile quick          # smoke run
+  python run_o1_benchmark_v2.py --profile methodology --image-sha <digest> \\
+        --pod-label <node label> --out results/<host>/o1.csv          # admissible run
+  python run_o1_benchmark_v2.py --models deepseek --context-lengths 2048,8192
+Only --profile methodology meets the v1.3 rule (5 min warm-up / 15 min capture /
+3 repeats); quick and standard are dry runs. Use one --out per node.
 
 Requires: torch with CUDA, vllm, transformers. Weights must be mirrored
 locally (HF_HUB_OFFLINE is forced — no live download during measurement).
@@ -59,6 +62,7 @@ import sys
 import time
 import uuid
 import subprocess
+import manifest
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -91,6 +95,15 @@ PLATFORMS = {
     # 80GB HBM shifts memory ceilings vs the on-prem H200 reference.
     "H100":   {"gpu_model": "h100-80gb-sxm5", "hbm_floor_gib": 70.0,
                "pod_default": "H100-A", "aliases": ["H100"]},
+    # Blackwell HGX. gpu_model strings follow methodology Appendix B. The floors sit
+    # below reported capacity (HGX B200 reports ~180 GB, Appendix B says 192) — confirm
+    # against nvidia-smi on first run; they only need to reject smaller SKUs / MIG.
+    "B200":   {"gpu_model": "b200-192gb-sxm", "hbm_floor_gib": 165.0,
+               "pod_default": "HGX-B200-A", "aliases": ["B200"]},
+    # B300 is NOT in the Appendix B gpu_model enum — needs WWT written agreement
+    # (Appendix A: no substitutions without it) before rows are submitted.
+    "B300":   {"gpu_model": "b300-288gb-sxm", "hbm_floor_gib": 260.0,
+               "pod_default": "HGX-B300-A", "aliases": ["B300"]},
 }
 
 MODELS = {
@@ -140,15 +153,15 @@ PROFILES = {
 
 CSV_FIELDS = [
     "outcome_id", "environment", "region_zone", "instance_type_or_pod",
-    "gpu_model", "gpu_count", "model_id", "model_sha256", "precision",
-    "scenario", "context_length_tokens", "kv_mode",
+    "gpu_model", "gpu_count", "hbm_effective_gib", "model_id", "model_sha256",
+    "precision", "reasoning_mode", "scenario", "context_length_tokens", "kv_mode",
     "concurrent_sessions", "concurrent_sessions_memory", "memory_ceiling_reason",
     "kv_bytes_per_session_config", "kv_bytes_per_session_measured",
     "p99_ttft_ms_at_interactive_ceiling",
     "itl_p50_ms", "itl_p90_ms", "itl_p99_ms", "itl_p99_ms_at_memory_ceiling",
     "gpu_mem_used_gb_max", "repeats_completed", "coefficient_of_variation",
     "cov_pass", "serving_stack", "harness_version", "driver_version",
-    "torch_version", "run_start_utc", "run_duration_seconds",
+    "firmware_version", "container_image_sha", "torch_version", "run_start_utc", "run_duration_seconds",
     "operator", "notes",
 ]
 
@@ -166,14 +179,14 @@ def die(msg):
 # Phase 1 — setup validation
 # ══════════════════════════════════════════════════════════════════════════════
 def validate_setup(args):
-    """Validate the XE9680 / 8x H200 environment. Returns env-info dict."""
+    """Validate the 8-GPU node (H200 / B200 / B300 / MI300X / H100). Returns env-info dict."""
     ok, warn = [], []
     info = {"host": platform.node(), "python": platform.python_version()}
 
     try:
         import torch
     except ImportError:
-        die("PyTorch not installed. pip install torch --index-url per NVIDIA docs")
+        die("PyTorch not installed — run inside the pinned vLLM container (see README)")
     info["torch_version"] = torch.__version__
     ok.append(f"torch {torch.__version__}")
 
@@ -208,6 +221,7 @@ def validate_setup(args):
     if min(mems) < plat["hbm_floor_gib"]:
         die(f"GPU HBM {min(mems):.1f} GiB < {plat['hbm_floor_gib']:.0f} GiB floor — "
             f"wrong SKU or a partition (MIG/CPX) is active")
+    info["hbm_min_gib"] = round(min(mems), 1)   # Appendix B / O1 CSP note: effective HBM
     ok.append(f"HBM per GPU: {min(mems):.1f} GiB")
 
     # P2P / NVLink reachability (TP8 requirement)
@@ -215,7 +229,7 @@ def validate_setup(args):
                 if i != j and not torch.cuda.can_device_access_peer(i, j)]
     if p2p_fail:
         die(f"P2P not available between GPU pairs {p2p_fail[:4]}... — check NVLink/fabric")
-    ok.append("P2P access verified across all 8 GPUs (NVLink)")
+    ok.append("P2P access verified across all 8 GPUs (NVLink / Infinity Fabric)")
 
     # Driver / ECC via NVML (optional but recommended)
     info["driver_version"] = "unknown"
@@ -699,11 +713,14 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
     return {
         "outcome_id": OUTCOME_ID, "environment": args.environment,
         "region_zone": args.region_zone,
-        "instance_type_or_pod": args.pod_label or info.get("pod_default", "unlabelled"),
+        "instance_type_or_pod": pod_label(args, info),
         "gpu_model": info.get("gpu_model_id", "unknown"),
-        "gpu_count": info["gpu_count"], "model_id": model_cfg["model_id"],
+        "gpu_count": info["gpu_count"], "hbm_effective_gib": info.get("hbm_min_gib", ""),
+        "model_id": model_cfg["model_id"],
         "model_sha256": model_cfg.get("pinned_sha256") or "unpinned",
-        "precision": model_cfg["precision"], "scenario": "server",
+        "precision": model_cfg["precision"],
+        "reasoning_mode": manifest.reasoning_mode(model_cfg["model_id"]),
+        "scenario": "server",
         "context_length_tokens": ctx,
         "kv_mode": kv_mode_str(block_size),
         "concurrent_sessions": slo,
@@ -720,8 +737,10 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
         "repeats_completed": reps, "coefficient_of_variation": round(cov, 4),
         "cov_pass": cov <= COV_LIMIT,
         "serving_stack": f"vllm-on-instance/{info.get('vllm_version','?')}",
-        "harness_version": "wwt-o1-harness/1.3.4-kvdtype",
+        "harness_version": "wwt-o1-harness/1.4.0-manifest",
         "driver_version": info.get("driver_version", ""),
+        "firmware_version": info.get("firmware_version", "unknown"),
+        "container_image_sha": args.image_sha,
         "torch_version": info.get("torch_version", ""),
         "run_start_utc": started,
         "run_duration_seconds": int(time.perf_counter() - t_cell),
@@ -737,21 +756,23 @@ async def run_cell(engine, tokenizer, model_cfg, ctx, block_size, prof, info, ar
 
 
 def done_cells(path):
+    """Skip key includes the node label so a CSV shared across machines never
+    makes a second GPU type skip cells the first one completed."""
     done = set()
     if os.path.exists(path):
         with open(path, newline="") as f:
             for row in csv.DictReader(f):
-                done.add((row["model_id"], row["context_length_tokens"], row["kv_mode"]))
+                done.add((row["instance_type_or_pod"], row["model_id"],
+                          row["context_length_tokens"], row["kv_mode"]))
     return done
 
 
+def pod_label(args, info):
+    return args.pod_label or info.get("pod_default", "unlabelled")
+
+
 def append_row(path, row):
-    new = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if new:
-            w.writeheader()
-        w.writerow(row)
+    manifest.append_row(path, CSV_FIELDS, row)
 
 
 async def main_async(args, info):
@@ -777,7 +798,7 @@ async def main_async(args, info):
             try:
                 for ctx in ctxs:
                     kv_mode = kv_mode_str(block)
-                    if (m["model_id"], str(ctx), kv_mode) in skip:
+                    if (pod_label(args, info), m["model_id"], str(ctx), kv_mode) in skip:
                         log(f"  ctx={ctx} block={block}: already in CSV — skipped")
                         continue
                     prof = dict(PROFILES[args.profile])
@@ -802,7 +823,7 @@ async def main_async(args, info):
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="O1 KV-cache scaling harness (v1.2)")
+    ap = argparse.ArgumentParser(description="O1 KV-cache scaling harness (v1.3 methodology)")
     ap.add_argument("--models", default="qwen,deepseek",
                     help=f"comma list from {list(MODELS)} (default: qwen,deepseek)")
     ap.add_argument("--context-lengths", default=None,
@@ -830,6 +851,9 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--stagger", type=float, default=0.25,
                     help="session admission stagger in seconds (v1.3: no bursts)")
+    ap.add_argument("--image-sha", default=os.environ.get("CONTAINER_IMAGE_SHA", "unknown"),
+                    help="digest of the container this runs in (Appendix B "
+                         "container_image_sha); this process can't see it from inside")
     ap.add_argument("--verify-sha", action="store_true",
                     help="verify weights against Appendix A pinned SHA-256")
     ap.add_argument("--validate-only", action="store_true")
@@ -870,6 +894,13 @@ def main():
     os.unlink(info_path)
     for k, p in info.pop("model_paths", {}).items():
         MODELS[k]["local_path"] = p
+    info["firmware_version"] = manifest.firmware()
+    if args.image_sha == "unknown":
+        log("WARNING: --image-sha / CONTAINER_IMAGE_SHA not set — rows will carry "
+            "container_image_sha=unknown (methodology: image SHA pinned and recorded)")
+    if args.profile != "methodology":
+        log(f"WARNING: profile '{args.profile}' is below the methodology rule "
+            f"(5 min warm-up, 15 min capture, 3 repeats) — dry-run data only")
     log(f"Profile '{args.profile}': {json.dumps(PROFILES[args.profile])}")
     log(f"TTFT ceiling bound: {TTFT_CEILING_MS} ms | CoV limit: {COV_LIMIT}")
     try:

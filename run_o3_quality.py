@@ -23,7 +23,9 @@ needs no vLLM/tokenizer/GPU anyway:
 
 Run:  python3 run_o3_quality.py --serve-image <pinned> \\
           --eval-image wwt/vllm-bench:o3eval --models qwen,qwen-fp8 \\
-          --operator <you> --out o3_quality.csv
+          --operator <you> --out results/<host>/o3.csv   # qwen FIRST: it is the
+          # BF16 reference the Appendix A 1.5% quality gate compares against
+          # (--nvidia needs --pod-label)
 
 NOTE: eval DATASETS download at runtime (HF_HUB_OFFLINE deliberately unset in
 the eval container only — datasets, not weights; recorded in notes). Partial,
@@ -32,8 +34,9 @@ O3 campaign.
 """
 import argparse, csv, glob, json, os, subprocess, sys, time  # noqa: E401
 from datetime import datetime, timezone
+import manifest
 
-HARNESS_VERSION = "wwt-o3lite-harness/1.2-crossvendor"
+HARNESS_VERSION = "wwt-o3lite-harness/1.3-manifest"
 MODELS = {
     "qwen":     {"model_id": "qwen3.5-122b-a10b", "precision": "bf16",
                  "hub": "models--Qwen--Qwen3.5-122B-A10B", "serve_args": [], "env": {}},
@@ -48,11 +51,16 @@ TASKS = [  # (lm-eval task, n-shot, per-subtask limit, primary metric key)
     ("gsm8k", 8, 250, "exact_match,strict-match"),
     ("mmlu", 5, 12, "acc,none"),
 ]
+# Appendix A tolerance vs the full-precision reference (absolute drop)
+TOLERANCE = {"gsm8k": 0.015, "mmlu": 0.015}
+REF_MODEL_ID = "qwen3.5-122b-a10b"   # pinned BF16 — the reference for the Qwen ladder
 CSV_FIELDS = ["outcome_id", "environment", "region_zone", "instance_type_or_pod",
-              "model_id", "precision", "task", "n_shot", "limit_per_subtask",
-              "metric", "value", "stderr", "serving_stack", "eval_harness",
-              "harness_version", "run_start_utc", "run_duration_s",
-              "operator", "notes"]
+              "model_id", "model_sha256", "precision", "reasoning_mode", "task",
+              "n_shot", "limit_per_subtask",
+              "metric", "value", "stderr", "reference_value", "delta_vs_reference",
+              "quality_eval_passed", "serving_stack", "eval_harness",
+              "harness_version", "firmware_version", "container_image_sha",
+              "run_start_utc", "run_duration_s", "operator", "notes"]
 
 def log(m):
     print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {m}", flush=True)
@@ -84,10 +92,19 @@ def start_serve(args, key, port):
                     "--max-model-len", "4096", "--port", str(port),
                     *m["serve_args"]], check=True)
 
-def wait_ready(port, timeout_s):
+def container_dead(name):
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "false"
+
+def wait_ready(port, timeout_s, name="o3serve"):
     import http.client
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
+        if container_dead(name):   # engine crashed — don't poll for the full timeout
+            log(f"{name} exited before becoming ready — last logs:")
+            subprocess.run(["docker", "logs", "--tail", "40", name])
+            return False
         try:
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("GET", "/health")
@@ -131,6 +148,31 @@ def parse_results(workdir, outdir, task, metric_key):
         node.get(f"{metric_key.split(',')[0]}_stderr,{metric_key.split(',')[1]}")
     return val, err, res.get("config", {}).get("model", "")
 
+def reference_value(out_path, pod, task):
+    """Value of the BF16 reference for this node+task, or None if not run yet."""
+    if not os.path.exists(out_path):
+        return None
+    for r in csv.DictReader(open(out_path)):
+        if (r["instance_type_or_pod"], r["model_id"], r["task"]) == (pod, REF_MODEL_ID, task) \
+                and r["value"]:
+            return float(r["value"])
+    return None
+
+def quality_gate(key, task, value, err, ref):
+    """Appendix A gate. Returns (reference, delta, passed, note). The reference row
+    itself is 'reference'; no reference yet (or DeepSeek, whose BF16 upcast is not
+    pinned) -> '' so nothing is claimed."""
+    if MODELS[key]["model_id"] == REF_MODEL_ID:
+        return "", "", "reference", ""
+    if ref is None:
+        return "", "", "", "; no full-precision reference row yet (run qwen first) — gate not evaluated"
+    delta, tol = ref - value, TOLERANCE[task]
+    note = ""
+    if err and 2 * err > tol:
+        note = (f"; stderr {err:.4f} x2 exceeds the {tol} tolerance — gate not "
+                f"statistically resolvable at this sample limit")
+    return round(ref, 4), round(delta, 4), delta <= tol, note
+
 def main():
     ap = argparse.ArgumentParser(description="O3-lite quality gate (host)")
     ap.add_argument("--serve-image", required=True)
@@ -143,23 +185,31 @@ def main():
     ap.add_argument("--workdir", default=os.path.expanduser("~/dl_script/gpubench"))
     ap.add_argument("--out", default="o3_quality.csv")
     ap.add_argument("--pod-label", default=None,
-                    help="defaults to MI300X-A, or DGX-H200-A with --nvidia")
+                    help="manifest node label; defaults to MI300X-A on AMD, "
+                         "REQUIRED with --nvidia (e.g. HGX-B200-A)")
     ap.add_argument("--environment", default="wwt-atc")
     ap.add_argument("--region-zone", default="on-prem")
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
     ap.add_argument("--nvidia", action="store_true")
     args = ap.parse_args()
     if args.pod_label is None:
-        args.pod_label = "DGX-H200-A" if args.nvidia else "MI300X-A"
+        if args.nvidia:
+            ap.error("--nvidia requires --pod-label (e.g. DGX-H200-A, HGX-B200-A) — "
+                     "a default would mislabel rows from other GPU types")
+        args.pod_label = "MI300X-A"
     models = [m.strip() for m in args.models.split(",")]
+    args.image_sha, fw = manifest.image_sha(args.serve_image), manifest.firmware()
+    if args.image_sha == "unknown":
+        log("WARNING: could not resolve the serve-image digest — pass --serve-image <repo@sha256:...>")
     out_path = os.path.join(args.workdir, args.out)
     done = set()
     if os.path.exists(out_path):
-        done = {(r["model_id"], r["task"]) for r in csv.DictReader(open(out_path))}
+        done = {(r["instance_type_or_pod"], r["model_id"], r["task"])
+                for r in csv.DictReader(open(out_path))}
 
     for key in models:
         pending = [(t, s, l, mk) for t, s, l, mk in TASKS
-                   if (MODELS[key]["model_id"], t) not in done]
+                   if (args.pod_label, MODELS[key]["model_id"], t) not in done]
         if not pending:
             log(f"{key}: all tasks already in CSV — skipped")
             continue
@@ -181,33 +231,36 @@ def main():
                 if val is None:
                     log(f"  {task}: could not parse results — nothing recorded")
                     continue
+                ref, delta, passed, gate_note = quality_gate(
+                    key, task, float(val), float(err) if err else 0.0,
+                    reference_value(out_path, args.pod_label, task))
                 row = {
                     "outcome_id": "O3-partial", "environment": args.environment,
                     "region_zone": args.region_zone,
                     "instance_type_or_pod": args.pod_label,
-                    "model_id": MODELS[key]["model_id"],
+                    "model_id": MODELS[key]["model_id"], "model_sha256": "unpinned",
                     "precision": MODELS[key]["precision"],
+                    "reasoning_mode": manifest.reasoning_mode(MODELS[key]["model_id"]),
                     "task": task, "n_shot": shots, "limit_per_subtask": limit,
                     "metric": metric_key, "value": round(float(val), 4),
                     "stderr": round(float(err), 4) if err else "",
+                    "reference_value": ref, "delta_vs_reference": delta,
+                    "quality_eval_passed": passed,
                     "serving_stack": f"vllm-serve/{args.serve_image}",
                     "eval_harness": args.eval_image,
                     "harness_version": HARNESS_VERSION,
+                    "firmware_version": fw, "container_image_sha": args.image_sha,
                     "run_start_utc": started,
                     "run_duration_s": int(time.monotonic() - t0),
                     "operator": args.operator,
                     "notes": ("non-MLPerf partial O3 quality probe; eval datasets "
                               "downloaded at runtime (datasets only — weights "
                               "remained offline); Appendix A tolerance gate "
-                              "requires the full suite"),
+                              "requires the full suite") + gate_note,
                 }
-                new = not os.path.exists(out_path)
-                with open(out_path, "a", newline="") as f:
-                    w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-                    if new:
-                        w.writeheader()
-                    w.writerow(row)
-                log(f"  {task}: {metric_key}={row['value']} -> {args.out}")
+                manifest.append_row(out_path, CSV_FIELDS, row)
+                log(f"  {task}: {metric_key}={row['value']} quality_eval_passed="
+                    f"{passed!r} -> {args.out}")
         finally:
             subprocess.run(["docker", "rm", "-f", "o3serve"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -63,7 +63,6 @@ def main():
 
     async def run():
         lat, ttft_first = [], None
-        nonlocal_first = {}
         for i in range(args.inferences):
             t1 = time.monotonic()
             first = None
@@ -73,11 +72,10 @@ def main():
                     first = time.monotonic()
             lat.append((time.monotonic() - t1) * 1000)
             if i == 0 and first:
-                nonlocal_first["ttft"] = (first - t1) * 1000
-        return lat, nonlocal_first.get("ttft")
+                ttft_first = (first - t1) * 1000
+        return lat, ttft_first
 
-    lat, ttft_first = asyncio.get_event_loop().run_until_complete(run()) \
-        if False else asyncio.run(run())
+    lat, ttft_first = asyncio.run(run())
 
     import vllm, torch  # noqa: E401
     result = {

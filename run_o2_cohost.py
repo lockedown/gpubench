@@ -18,11 +18,11 @@ Isolation score (v1.3 page-3): victim P99 under pressure / victim P99 at 50/50.
   sudo python3 run_o2_cohost.py --image <pinned-rocm-digest> \
       --pair qwen-fp8,deepseek --operator <you> --out o2_results.csv
 
-NVIDIA (H200/DGX): add --nvidia and use the CUDA image; ROCm-specific model
-env (VLLM_ROCM_*) is dropped automatically:
+NVIDIA (H200 / B200 / B300): add --nvidia --pod-label <node label> and use the CUDA
+image; ROCm-specific model env (VLLM_ROCM_*) is dropped automatically:
 
-  sudo python3 run_o2_cohost.py --nvidia --image wwt/vllm-bench:o1 \
-      --pair qwen-fp8,qwen --gpus 0,1,2,3 --operator <you> --out o2_results.csv
+  sudo python3 run_o2_cohost.py --nvidia --pod-label HGX-B200-A --image wwt/vllm-bench:o1 \
+      --pair qwen-fp8,qwen --gpus 0,1,2,3 --operator <you> --out results/<host>/o2.csv
 
 Scope caveat (recorded per row): this is co-tenancy via memory partition on
 shared GPUs — the closest legal topology on MI300X without CPX partitioning
@@ -31,8 +31,9 @@ shared GPUs — the closest legal topology on MI300X without CPX partitioning
 import argparse, csv, http.client, json, os, statistics, subprocess, sys  # noqa: E401
 import threading, time  # noqa: E401
 from datetime import datetime, timezone
+import manifest
 
-HARNESS_VERSION = "wwt-o2-harness/1.3-crossvendor"
+HARNESS_VERSION = "wwt-o2-harness/1.4-manifest"
 TTFT_BOUND_MS = 1500.0
 RAMP_BUDGET_S = 20.0
 WINDOW_S = 45.0                      # steady-state capture per probe/phase
@@ -53,10 +54,11 @@ PROMPT = ("The quarterly risk assessment covering liquidity market and operation
           "reconciliation of the following positions and their hedges. ") * 55
 
 CSV_FIELDS = ["outcome_id", "environment", "region_zone", "instance_type_or_pod",
-              "topology", "model_id", "precision", "role", "workers",
+              "topology", "model_id", "model_sha256", "precision", "reasoning_mode", "role", "workers",
               "siloed_ceiling", "p99_ttft_ms", "itl_p50_ms", "itl_p99_ms",
               "baseline_p99_ttft_ms", "isolation_score_ttft",
-              "serving_stack", "harness_version", "run_start_utc", "operator", "notes"]
+              "serving_stack", "harness_version", "firmware_version", "container_image_sha",
+              "run_start_utc", "operator", "notes"]
 
 def log(m):
     print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {m}", flush=True)
@@ -184,9 +186,16 @@ def start_serve(args, key, name, port, util):
     subprocess.run(cmd, check=True)
     log(f"  {name} ({key}) starting on :{port} — waiting for ready")
 
-def wait_ready(port, timeout_s):
+def container_dead(name):
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "false"
+
+def wait_ready(port, timeout_s, name=None):
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
+        if name and container_dead(name):   # engine crashed — fail now, caller dumps logs
+            return False
         try:
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             c.request("GET", "/health")
@@ -220,12 +229,7 @@ def stop_all(names):
 
 # ── main flow ──────────────────────────────────────────────────────────────────
 def write_row(args, row):
-    new = not os.path.exists(args.out)
-    with open(args.out, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if new:
-            w.writeheader()
-        w.writerow(row)
+    manifest.append_row(args.out, CSV_FIELDS, row)
 
 def emit(args, rows, topology, key, role, workers, ceiling, burst,
          baseline_p99=None):
@@ -236,7 +240,10 @@ def emit(args, rows, topology, key, role, workers, ceiling, burst,
         "outcome_id": "O2", "environment": args.environment,
         "region_zone": args.region_zone, "instance_type_or_pod": args.pod_label,
         "topology": topology, "model_id": MODELS[key]["model_id"],
-        "precision": MODELS[key]["precision"], "role": role, "workers": workers,
+        "model_sha256": "unpinned",
+        "precision": MODELS[key]["precision"],
+        "reasoning_mode": manifest.reasoning_mode(MODELS[key]["model_id"]),
+        "role": role, "workers": workers,
         "siloed_ceiling": ceiling, "p99_ttft_ms": p99,
         "itl_p50_ms": round(pctl(burst.itl, 0.5), 2) if burst.itl else "",
         "itl_p99_ms": round(pctl(burst.itl, 0.99), 2) if burst.itl else "",
@@ -244,6 +251,7 @@ def emit(args, rows, topology, key, role, workers, ceiling, burst,
         "isolation_score_ttft": iso,
         "serving_stack": f"vllm-serve/{args.image}",
         "harness_version": HARNESS_VERSION,
+        "firmware_version": args.firmware, "container_image_sha": args.image_sha,
         "run_start_utc": datetime.now(timezone.utc).isoformat(),
         "operator": args.operator,
         "notes": f"shared GPUs {args.gpus} tp{args.tp} mem_frac={args.mem_frac}; "
@@ -267,7 +275,8 @@ def main():
     ap.add_argument("--cache-dir", default="/opt/huggingface-cache")
     ap.add_argument("--out", default="o2_results.csv")
     ap.add_argument("--pod-label", default=None,
-                    help="defaults to MI300X-A, or DGX-H200-A with --nvidia")
+                    help="manifest node label; defaults to MI300X-A on AMD, "
+                         "REQUIRED with --nvidia (e.g. HGX-B200-A)")
     ap.add_argument("--environment", default="wwt-atc")
     ap.add_argument("--region-zone", default="on-prem")
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
@@ -276,7 +285,13 @@ def main():
                     help="seconds to wait for VRAM release between phases")
     args = ap.parse_args()
     if args.pod_label is None:
-        args.pod_label = "DGX-H200-A" if args.nvidia else "MI300X-A"
+        if args.nvidia:
+            ap.error("--nvidia requires --pod-label (e.g. DGX-H200-A, HGX-B200-A) — "
+                     "a default would mislabel rows from other GPU types")
+        args.pod_label = "MI300X-A"
+    args.image_sha, args.firmware = manifest.image_sha(args.image), manifest.firmware()
+    if args.image_sha == "unknown":
+        log("WARNING: could not resolve the image digest — pass --image <repo@sha256:...>")
     a_key, b_key = [x.strip() for x in args.pair.split(",")]
     ports = {a_key: 8801, b_key: 8802}
     names = {a_key: "o2a", b_key: "o2b"}
@@ -287,7 +302,7 @@ def main():
         for key in (a_key, b_key):
             log(f"── siloed: {key}")
             start_serve(args, key, names[key], ports[key], args.mem_frac)
-            if not wait_ready(ports[key], args.ready_timeout):
+            if not wait_ready(ports[key], args.ready_timeout, names[key]):
                 dump_logs(names[key])
                 sys.exit(f"{key} never became ready — container logs above")
             c, b = find_ceiling(ports[key], key, args.out_tokens, args.max_workers)
@@ -305,7 +320,7 @@ def main():
                  b_key: min(round(2 * args.mem_frac, 2), 0.95)}
         for key in (a_key, b_key):
             start_serve(args, key, names[key], ports[key], utils[key])
-            if not wait_ready(ports[key], args.ready_timeout):
+            if not wait_ready(ports[key], args.ready_timeout, names[key]):
                 dump_logs(names[key])
                 sys.exit(f"{key} never became ready (co-host) — logs above")
         half = {k: max(1, round(0.5 * ceilings[k])) for k in (a_key, b_key)}

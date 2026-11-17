@@ -35,12 +35,14 @@ os.chmod(f"{ROOT}/bin/docker", 0o755)
 open(f"{ROOT}/work/o9_probe.py", "w").write("# placeholder\n")
 
 # import orchestrator with patched primitives
-sys.path.insert(0, "/sessions/practical-trusting-fermi/mnt/outputs")
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 import run_o9_benchmark as h  # noqa: E402
 
 _sect = {"v": 1000}
 h.sectors_read = lambda: _sect.__setitem__("v", _sect["v"] + 250_000_000) or _sect["v"]
 h.drop_caches = lambda: print("  (fake cache drop)")
+h.manifest.image_sha = lambda image: "fake@sha256:" + "0" * 64
 os.environ["PATH"] = f"{ROOT}/bin:" + os.environ["PATH"]
 os.geteuid = os.geteuid  # cold check bypassed via monkeypatch below
 h.os.geteuid = lambda: 0
@@ -60,6 +62,16 @@ check("first vs steady separated", float(r["first_infer_ms"]) > 100
 check("bytes read metered", abs(float(r["bytes_read_gb"]) - 119.2) < 1,
       r["bytes_read_gb"])   # 250M sectors x 512B = ~119.2GB
 check("cache_state cold first", r["cache_state"] == "cold" and r["repeat"] == "1")
+check("manifest fields", r["container_image_sha"].startswith("fake@sha256:")
+      and r["reasoning_mode"] == "n/a" and r["model_sha256"] == "unpinned")
+open(f"{ROOT}/work/old.csv", "w").write("a,b\n1,2\n")
+try:
+    h.manifest.append_row(f"{ROOT}/work/old.csv", h.CSV_FIELDS, {})
+    check("header guard refuses old-layout CSV", False)
+except SystemExit:
+    check("header guard refuses old-layout CSV", True)
+check("skip key includes node label",
+      all(len(k) == 4 for k in h.done_cells(f"{ROOT}/work/o9.csv")))
 
 # resume: re-run must skip all four
 h.main()
@@ -68,7 +80,7 @@ check("resume-skip on re-run", len(rows2) == 4, f"{len(rows2)}")
 
 # probe syntax check (can't execute without vllm)
 rc = subprocess.run([sys.executable, "-m", "py_compile",
-                     "/sessions/practical-trusting-fermi/mnt/outputs/o9_probe.py"]).returncode
+                     os.path.join(HERE, "o9_probe.py")]).returncode
 check("probe compiles", rc == 0)
 
 print(f"\n{len(fails)} failures")

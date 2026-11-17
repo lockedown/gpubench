@@ -1,7 +1,7 @@
-# O1 harness (run_o1_benchmark.py) — XE9680 / 8x H200
-# Python 3.10-3.12 required. Do NOT use 3.14 — vLLM has no wheels for it yet
-# (see O1_SETUP.md). Versions pinned per methodology Appendix A: same versions
-# in every environment for the duration of the engagement.
+# O1 harness (run_o1_benchmark_v2.py) — bare-metal install, 8x NVIDIA (H200/B200/B300)
+# Python 3.10-3.12 required. Do NOT use 3.14 — vLLM has no wheels for it yet.
+# Versions pinned per methodology Appendix A: same versions in every environment
+# for the duration of the engagement. Container runs (setup_hgx.sh) don't need this.
 
 # Serving stack — this pin also pins the matching torch (2.11.0+cu13x) and
 # transformers as dependencies. Do not install torch separately first; let

@@ -50,7 +50,8 @@ for port in (8801, 8802):
     servers.append(srv)
 
 # ── O2 e2e ────────────────────────────────────────────────────────────────────
-sys.path.insert(0, "/sessions/practical-trusting-fermi/mnt/outputs")
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 import run_o2_cohost as o2  # noqa: E402
 o2.WINDOW_S = 0.5
 o2.RAMP_BUDGET_S = 0.3
@@ -116,6 +117,7 @@ os.chmod(f"{ROOT}/bin/docker", 0o755)
 os.environ["PATH"] = f"{ROOT}/bin:" + os.environ["PATH"]
 o3.start_serve = lambda *a, **k: None
 o3.wait_ready = lambda *a, **k: True
+o3.snapshot_dir = lambda *a, **k: "/fake"
 sys.argv = ["x", "--serve-image", "s:img", "--eval-image", "e:img",
             "--models", "qwen", "--workdir", f"{ROOT}/work",
             "--out", "o3.csv", "--operator", "test"]
@@ -125,6 +127,13 @@ check("2 task rows", len(rows) == 2, f"{len(rows)}")
 check("gsm8k + mmlu values", {r["task"]: r["value"] for r in rows} ==
       {"gsm8k": "0.79", "mmlu": "0.7412"}, str({r["task"]: r["value"] for r in rows}))
 check("O3 CSV fields", list(rows[0].keys()) == o3.CSV_FIELDS)
+check("O3 reference row flagged", all(r["quality_eval_passed"] == "reference" for r in rows))
+# Appendix A gate: 1.5% absolute tolerance
+check("gate passes within tolerance", o3.quality_gate("qwen-fp8", "gsm8k", 0.79, 0.004, 0.80)[2] is True)
+check("gate fails beyond tolerance", o3.quality_gate("qwen-fp8", "gsm8k", 0.78, 0.004, 0.80)[2] is False)
+check("gate silent without a reference", o3.quality_gate("deepseek", "mmlu", 0.7, 0.01, None)[2] == "")
+check("gate warns when stderr can't resolve tolerance",
+      "not statistically resolvable" in o3.quality_gate("qwen-fp8", "gsm8k", 0.79, 0.025, 0.80)[3])
 o3.main()   # resume
 rows2 = list(csv.DictReader(open(f"{ROOT}/work/o3.csv")))
 check("O3 resume-skip", len(rows2) == 2, f"{len(rows2)}")

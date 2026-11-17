@@ -7,8 +7,10 @@ Python 3.8+; no GPU libraries needed here). Launches the in-container probe
 (o9_probe.py) per (model x cache-state x repeat), dropping the OS page cache
 for cold runs and metering actual NVMe bytes read via /proc/diskstats.
 
-  sudo python3 run_o9_benchmark.py --image vllm/vllm-openai-rocm:nightly \
-      --models qwen,qwen-fp8,deepseek --repeats 2 --out o9_results.csv
+  sudo python3 run_o9_benchmark.py --image <pinned-image-digest> \
+      --models qwen,qwen-fp8,deepseek --repeats 2 --out results/<host>/o9.csv
+
+NVIDIA: add --nvidia --pod-label <node label> (label is required; no default).
 
 sudo is required for cache drops (cold cells). Runs are sequential and
 foreground; use tmux. Resume-safe: completed (model,cache_state,repeat)
@@ -19,8 +21,9 @@ sudo (HOME=/root) can no longer lose the probe.
 """
 import argparse, csv, json, os, subprocess, sys, time  # noqa: E401
 from datetime import datetime, timezone
+import manifest
 
-HARNESS_VERSION = "wwt-o9-harness/1.3-quiesce"
+HARNESS_VERSION = "wwt-o9-harness/1.4-manifest"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS = {
     "qwen":     "models--Qwen--Qwen3.5-122B-A10B",
@@ -29,10 +32,11 @@ MODELS = {
 }
 CSV_FIELDS = [
     "outcome_id", "environment", "region_zone", "instance_type_or_pod",
-    "model_id", "source", "format", "cache_state", "repeat",
+    "model_id", "model_sha256", "reasoning_mode", "source", "format", "cache_state", "repeat",
     "import_s", "engine_build_s", "total_ready_s",
     "ttft_first_ms", "first_infer_ms", "first10_p50_ms", "steady_last20_ms",
     "bytes_read_gb", "serving_stack", "harness_version",
+    "firmware_version", "container_image_sha",
     "run_start_utc", "operator", "notes",
 ]
 
@@ -77,11 +81,22 @@ def docker_cmd(args, key, probe_out):
              "--out", f"/work/{probe_out}"])
 
 def done_cells(path):
+    """Key includes the node label: a shared CSV must not skip another GPU's cells."""
     if not os.path.exists(path):
         return set()
     with open(path, newline="") as f:
-        return {(r["model_id"], r["cache_state"], r["repeat"])
+        return {(r["instance_type_or_pod"], r["model_id"], r["cache_state"], r["repeat"])
                 for r in csv.DictReader(f)}
+
+def model_gb(cache_dir, key):
+    """Weight size on disk (host view); 0 if the snapshot can't be read."""
+    base = os.path.join(cache_dir, "hub", MODELS[key], "snapshots")
+    try:
+        d = os.path.join(base, sorted(os.listdir(base))[-1])
+        return sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)
+                   if f.endswith(".safetensors")) / 1024**3
+    except OSError:
+        return 0.0
 
 def wait_gpu_quiesce(nvidia, timeout_s=180, threshold_mb=2048):
     """Block until all GPUs are near-empty (previous cell/container fully
@@ -126,7 +141,8 @@ def main():
     ap.add_argument("--workdir", default=os.path.expanduser("~/dl_script/gpubench"))
     ap.add_argument("--out", default="o9_results.csv")
     ap.add_argument("--pod-label", default=None,
-                    help="defaults to MI300X-A, or DGX-H200-A with --nvidia")
+                    help="manifest node label; defaults to MI300X-A on AMD, "
+                         "REQUIRED with --nvidia (e.g. HGX-B200-A)")
     ap.add_argument("--environment", default="wwt-atc")
     ap.add_argument("--region-zone", default="on-prem")
     ap.add_argument("--operator", default=os.environ.get("SUDO_USER") or
@@ -138,7 +154,10 @@ def main():
                          "o9_curves.jsonl and delete)")
     args = ap.parse_args()
     if args.pod_label is None:
-        args.pod_label = "DGX-H200-A" if args.nvidia else "MI300X-A"
+        if args.nvidia:
+            ap.error("--nvidia requires --pod-label (e.g. DGX-H200-A, HGX-B200-A) — "
+                     "a default would mislabel rows from other GPU types")
+        args.pod_label = "MI300X-A"
     models = [m.strip() for m in args.models.split(",")]
     states = [s.strip() for s in args.cache_states.split(",")]
     for m in models:
@@ -150,12 +169,15 @@ def main():
         sys.exit(f"o9_probe.py not found next to this script ({SCRIPT_DIR}) — "
                  "keep the pair together")
 
+    img_sha, fw = manifest.image_sha(args.image), manifest.firmware()
+    if img_sha == "unknown":
+        log("WARNING: could not resolve the image digest — pass --image <repo@sha256:...>")
     skip = done_cells(os.path.join(args.workdir, args.out))
     out_path = os.path.join(args.workdir, args.out)
     for key in models:
         for state in states:
             for rep in range(1, args.repeats + 1):
-                if (key, state, str(rep)) in skip:
+                if (args.pod_label, key, state, str(rep)) in skip:
                     log(f"{key}/{state}/r{rep}: already in CSV — skipped")
                     continue
                 log(f"── {key} | {state} | repeat {rep}")
@@ -167,6 +189,11 @@ def main():
                 started = datetime.now(timezone.utc).isoformat()
                 rc = subprocess.run(docker_cmd(args, key, probe_out)).returncode
                 gb = (sectors_read() - s0) * 512 / 1024**3
+                size_gb = model_gb(args.cache_dir, key)
+                cold_blind = state == "cold" and size_gb > 0 and gb < 0.5 * size_gb
+                if cold_blind:
+                    log(f"  WARNING: cold cell read {gb:.1f} GB of a {size_gb:.0f} GB model — "
+                        "weights on network/non-NVMe storage? bytes_read_gb is not trustworthy")
                 if rc != 0:
                     log(f"  probe FAILED rc={rc} — recorded nothing; fix and re-run")
                     continue
@@ -179,7 +206,8 @@ def main():
                     "outcome_id": "O9", "environment": args.environment,
                     "region_zone": args.region_zone,
                     "instance_type_or_pod": args.pod_label,
-                    "model_id": key, "source": "local-nvme", "format": "safetensors",
+                    "model_id": key, "model_sha256": "unpinned",
+                    "reasoning_mode": manifest.reasoning_mode(key), "source": "local-nvme", "format": "safetensors",
                     "cache_state": state, "repeat": rep,
                     "import_s": p["import_s"], "engine_build_s": p["engine_build_s"],
                     "total_ready_s": p["total_ready_s"],
@@ -189,18 +217,16 @@ def main():
                     "bytes_read_gb": round(gb, 1),
                     "serving_stack": f"vllm-on-instance/{p['vllm_version']}",
                     "harness_version": HARNESS_VERSION,
+                    "firmware_version": fw, "container_image_sha": img_sha,
                     "run_start_utc": started, "operator": args.operator,
                     "notes": f"image={args.image}; tp={args.tp}; "
                              f"wall_s={round(time.monotonic()-t0,1)}; "
                              f"methodology=v1.3 O9 (source/format matrix reduced to "
-                             f"local-nvme/safetensors — the only source on this node)",
+                             f"local-nvme/safetensors — the only source on this node)"
+                             + ("; WARNING: bytes_read_gb < 50% of model size on a cold "
+                                "cell (network storage?)" if cold_blind else ""),
                 }
-                new = not os.path.exists(out_path)
-                with open(out_path, "a", newline="") as f:
-                    w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-                    if new:
-                        w.writeheader()
-                    w.writerow(row)
+                manifest.append_row(out_path, CSV_FIELDS, row)
                 # consolidate the first-100 curve into one JSONL, drop the
                 # per-cell probe file (methodology keeps the curve; the CSV
                 # keeps the aggregates; nobody needs 12 loose JSON files)
