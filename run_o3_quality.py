@@ -141,7 +141,8 @@ def parse_results(workdir, outdir, task, metric_key):
                             recursive=True))
     if not hits:
         return None, None, None
-    res = json.load(open(hits[-1]))
+    with open(hits[-1]) as f:
+        res = json.load(f)
     node = res.get("results", {}).get(task) or {}
     val = node.get(metric_key)
     err = node.get(metric_key.replace(",", "_stderr,", 1)) or \
@@ -152,10 +153,11 @@ def reference_value(out_path, pod, task):
     """Value of the BF16 reference for this node+task, or None if not run yet."""
     if not os.path.exists(out_path):
         return None
-    for r in csv.DictReader(open(out_path)):
-        if (r["instance_type_or_pod"], r["model_id"], r["task"]) == (pod, REF_MODEL_ID, task) \
-                and r["value"]:
-            return float(r["value"])
+    with open(out_path, newline="") as f:
+        for r in csv.DictReader(f):
+            if (r["instance_type_or_pod"], r["model_id"], r["task"]) == (pod, REF_MODEL_ID, task) \
+                    and r["value"]:
+                return float(r["value"])
     return None
 
 def quality_gate(key, task, value, err, ref):
@@ -205,8 +207,9 @@ def main():
     manifest.check_header(out_path, CSV_FIELDS)   # fail now, not after the first eval
     done = set()
     if os.path.exists(out_path):
-        done = {(r["instance_type_or_pod"], r["model_id"], r["task"])
-                for r in csv.DictReader(open(out_path))}
+        with open(out_path, newline="") as f:
+            done = {(r["instance_type_or_pod"], r["model_id"], r["task"])
+                    for r in csv.DictReader(f)}
 
     for key in models:
         pending = [(t, s, l, mk) for t, s, l, mk in TASKS
