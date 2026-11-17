@@ -130,6 +130,7 @@ check("O3 CSV fields", list(rows[0].keys()) == o3.CSV_FIELDS)
 check("O3 reference row flagged", all(r["quality_eval_passed"] == "reference" for r in rows))
 # Appendix A gate: 1.5% absolute tolerance
 check("gate passes within tolerance", o3.quality_gate("qwen-fp8", "gsm8k", 0.79, 0.004, 0.80)[2] is True)
+check("gate passes at exactly 1.5% (float boundary)", o3.quality_gate("qwen-fp8", "gsm8k", 0.785, 0.004, 0.80)[2] is True)
 check("gate fails beyond tolerance", o3.quality_gate("qwen-fp8", "gsm8k", 0.78, 0.004, 0.80)[2] is False)
 check("gate silent without a reference", o3.quality_gate("deepseek", "mmlu", 0.7, 0.01, None)[2] == "")
 check("gate warns when stderr can't resolve tolerance",

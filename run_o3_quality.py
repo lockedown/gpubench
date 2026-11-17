@@ -166,7 +166,7 @@ def quality_gate(key, task, value, err, ref):
         return "", "", "reference", ""
     if ref is None:
         return "", "", "", "; no full-precision reference row yet (run qwen first) — gate not evaluated"
-    delta, tol = ref - value, TOLERANCE[task]
+    delta, tol = round(ref - value, 4), TOLERANCE[task]   # round: 0.8-0.785 > 0.015 in floats
     note = ""
     if err and 2 * err > tol:
         note = (f"; stderr {err:.4f} x2 exceeds the {tol} tolerance — gate not "
@@ -202,6 +202,7 @@ def main():
     if args.image_sha == "unknown":
         log("WARNING: could not resolve the serve-image digest — pass --serve-image <repo@sha256:...>")
     out_path = os.path.join(args.workdir, args.out)
+    manifest.check_header(out_path, CSV_FIELDS)   # fail now, not after the first eval
     done = set()
     if os.path.exists(out_path):
         done = {(r["instance_type_or_pod"], r["model_id"], r["task"])

@@ -289,6 +289,7 @@ def main():
             ap.error("--nvidia requires --pod-label (e.g. DGX-H200-A, HGX-B200-A) — "
                      "a default would mislabel rows from other GPU types")
         args.pod_label = "MI300X-A"
+    manifest.check_header(args.out, CSV_FIELDS)   # fail now, not after the siloed phase
     args.image_sha, args.firmware = manifest.image_sha(args.image), manifest.firmware()
     if args.image_sha == "unknown":
         log("WARNING: could not resolve the image digest — pass --image <repo@sha256:...>")

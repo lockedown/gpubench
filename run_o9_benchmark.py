@@ -172,8 +172,9 @@ def main():
     img_sha, fw = manifest.image_sha(args.image), manifest.firmware()
     if img_sha == "unknown":
         log("WARNING: could not resolve the image digest — pass --image <repo@sha256:...>")
-    skip = done_cells(os.path.join(args.workdir, args.out))
     out_path = os.path.join(args.workdir, args.out)
+    manifest.check_header(out_path, CSV_FIELDS)   # fail now, not after the first probe
+    skip = done_cells(out_path)
     for key in models:
         for state in states:
             for rep in range(1, args.repeats + 1):

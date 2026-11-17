@@ -56,7 +56,8 @@ ECC="$(nvidia-smi --query-gpu=ecc.mode.current --format=csv,noheader | sort -u |
 # NVLink: TP8 needs the NVSwitch fabric up. Fabric manager must match the driver branch.
 systemctl is-active --quiet nvidia-fabricmanager \
   || fail "nvidia-fabricmanager not active — install the version matching driver $DRV and 'systemctl enable --now nvidia-fabricmanager' (Blackwell HGX may also need nvlsm per vendor guide)"
-nvidia-smi nvlink --status -i 0 | grep -q "GB/s" || fail "no active NVLink on GPU 0 — fabric not up"
+NVL="$(nvidia-smi nvlink --status -i 0)"   # not piped into grep -q: SIGPIPE + pipefail = false failure
+grep -q "GB/s" <<<"$NVL" || fail "no active NVLink on GPU 0 — fabric not up"
 echo "fabric manager active, NVLink up"
 
 # ── 2. Disk ──────────────────────────────────────────────────────────────────

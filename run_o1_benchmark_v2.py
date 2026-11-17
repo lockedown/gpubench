@@ -178,6 +178,12 @@ def die(msg):
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 1 — setup validation
 # ══════════════════════════════════════════════════════════════════════════════
+def detect_platform(name):
+    """PLATFORMS entry whose alias appears in the device name, else None."""
+    return next((PLATFORMS[k] for k in PLATFORMS
+                 if any(a in name for a in PLATFORMS[k]["aliases"])), None)
+
+
 def validate_setup(args):
     """Validate the 8-GPU node (H200 / B200 / B300 / MI300X / H100). Returns env-info dict."""
     ok, warn = [], []
@@ -211,8 +217,7 @@ def validate_setup(args):
     if len(names) != 1:
         die(f"Mixed GPU models: {names}")
     name = names.pop()
-    plat = next((PLATFORMS[k] for k in PLATFORMS
-                 if any(a in name for a in PLATFORMS[k]["aliases"])), None)
+    plat = detect_platform(name)
     if plat is None:
         die(f"Unrecognised GPU '{name}' — expected an alias of {list(PLATFORMS)}")
     info["gpu_model_id"] = plat["gpu_model"]
@@ -875,6 +880,7 @@ def main():
         validate_setup(args)
         log("Validation only — exiting.")
         return
+    manifest.check_header(args.out, CSV_FIELDS)   # fail now, not at the first write
     # Run validation in a SEPARATE process: the GPU probes (P2P, device props)
     # initialize CUDA, and vLLM V1's spawned engine cores fail to start if the
     # parent already holds a CUDA context. The sweep process stays CUDA-clean.

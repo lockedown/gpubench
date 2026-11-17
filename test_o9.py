@@ -70,6 +70,16 @@ try:
     check("header guard refuses old-layout CSV", False)
 except SystemExit:
     check("header guard refuses old-layout CSV", True)
+# start-up guard: old-layout --out must abort BEFORE any probe runs
+open(f"{ROOT}/work/stale.csv", "w").write("a,b\n1,2\n")
+_argv = sys.argv
+sys.argv = ["x", "--image", "fake:img", "--models", "qwen", "--cache-states", "warm",
+            "--cache-dir", f"{ROOT}/cache", "--workdir", f"{ROOT}/work", "--out", "stale.csv"]
+try:
+    h.main(); check("O9 aborts at start-up on old-layout CSV", False)
+except SystemExit as e:
+    check("O9 aborts at start-up on old-layout CSV", "column layout" in str(e))
+sys.argv = _argv
 check("skip key includes node label",
       all(len(k) == 4 for k in h.done_cells(f"{ROOT}/work/o9.csv")))
 

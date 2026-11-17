@@ -150,12 +150,12 @@ MTEB/DocVQA, O4, O5, O7, O8, O10, O11, and the Qwen3-Embedding-8B model (O2/O3/O
 
 ## Testing
 
-`test_o9.py` and `test_o2_o3.py` run anywhere (no GPUs, fake docker). The O1 suite
+`test_o1_basic.py` (platform detection, resume key, CSV guard), `test_o9.py` and `test_o2_o3.py` run anywhere (no GPUs, fake docker). The O1 suite
 (`test_o1_harness.py`, 25 checks, mocked torch/vllm/engine) is **not in this repo yet** —
 copy it from the artefact repo; all three gate any harness change:
 
 ```bash
-python3 test_o9.py && python3 test_o2_o3.py && python3 test_o1_harness.py
+python3 test_o1_basic.py && python3 test_o9.py && python3 test_o2_o3.py && python3 test_o1_harness.py
 ```
 
 ## Known issues / open items

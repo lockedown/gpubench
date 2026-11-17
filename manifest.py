@@ -44,9 +44,10 @@ def reasoning_mode(model_id):
     return "non-think" if str(model_id).startswith("deepseek") else "n/a"
 
 
-def append_row(path, fields, row):
-    """Append a row; refuse if the file's header differs from `fields` (a changed
-    schema appended to an old CSV would silently shift every column)."""
+def check_header(path, fields):
+    """Exit if `path` exists with a different column layout than `fields` (a changed
+    schema appended to an old CSV would silently shift every column). Call at
+    start-up so a resumed run fails now, not hours in at the first write."""
     if os.path.exists(path) and os.path.getsize(path) > 0:
         with open(path, newline="") as f:
             header = next(csv.reader(f), [])
@@ -54,9 +55,12 @@ def append_row(path, fields, row):
             raise SystemExit(
                 f"FATAL: {path} has a different column layout than this harness "
                 f"version writes. Use a new --out file (one per node/run).")
-        new = False
-    else:
-        new = True
+
+
+def append_row(path, fields, row):
+    """Append a row (header guard re-checked on every write)."""
+    check_header(path, fields)
+    new = not (os.path.exists(path) and os.path.getsize(path) > 0)
     with open(path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         if new:
